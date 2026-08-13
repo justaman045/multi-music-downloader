@@ -5,6 +5,14 @@ venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets
+.env
+*.pem
+*.key
 
 # App data - contains secrets (auth headers/cookies) and downloads.
 # Never commit these.

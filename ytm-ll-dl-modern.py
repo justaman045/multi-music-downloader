@@ -60,8 +60,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "3.11.0"
-APP_BUILD = "2026-08-13-github-release-prep"
+APP_VERSION = "3.12.0"
+APP_BUILD = "2026-08-13-safety-foundation"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
