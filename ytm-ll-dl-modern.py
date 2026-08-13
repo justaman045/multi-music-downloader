@@ -60,8 +60,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "3.12.0"
-APP_BUILD = "2026-08-13-safety-foundation"
+APP_VERSION = "4.0.0"
+APP_BUILD = "2026-08-13-web-ui-local-spotify"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -7277,12 +7277,18 @@ class YTMusicDownloader(App):
 def print_help() -> None:
     print(f"ytm-ll-dl-modern.py v{APP_VERSION}  (build {APP_BUILD})")
     print()
-    print("Multi-account YouTube Music liked-music downloader (TUI).")
+    print("Multi-account YouTube Music liked-music downloader (TUI + web UI).")
     print()
     print("Usage:")
     print("    ./run.sh                 Start the TUI")
     print("    ./run.sh --version       Print version info")
     print("    ./run.sh --help          Show this help")
+    print("    ./run.sh serve           Start the local Spotify-style web UI")
+    print()
+    print("Serve options:")
+    print("    --host HOST    Bind address (default 127.0.0.1)")
+    print("    --port PORT    Port (default 8765)")
+    print("    --token TOKEN  Require this token for LAN/remote access")
     print()
     print("First-time setup:")
     print("    ./install.sh             Create ./venv and install everything")
@@ -7295,13 +7301,56 @@ def print_help() -> None:
 
 
 def main() -> None:
-    if any(arg in {"--version", "-V"} for arg in sys.argv[1:]):
+    args = sys.argv[1:]
+
+    if any(arg in {"--version", "-V"} for arg in args):
         print(f"ytm-ll-dl-modern.py v{APP_VERSION}")
         print(f"Build: {APP_BUILD}")
         return
 
-    if any(arg in {"--help", "-h"} for arg in sys.argv[1:]):
+    if any(arg in {"--help", "-h"} for arg in args):
         print_help()
+        return
+
+    if args and args[0] == "serve":
+        from web.server import run_server
+
+        host = "127.0.0.1"
+        port = 8765
+        token = None
+
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "--host" and index + 1 < len(args):
+                host = args[index + 1]
+                index += 2
+            elif arg == "--port" and index + 1 < len(args):
+                try:
+                    port = int(args[index + 1])
+                except ValueError:
+                    print(f"Invalid port: {args[index + 1]}")
+                    sys.exit(1)
+                index += 2
+            elif arg == "--token" and index + 1 < len(args):
+                token = args[index + 1]
+                index += 2
+            else:
+                index += 1
+
+        if host not in {"127.0.0.1", "localhost", "::1"} and not token:
+            print(
+                "Binding to a non-loopback address requires --token. "
+                "Refusing to start."
+            )
+            sys.exit(1)
+
+        run_server(
+            sys.modules[__name__],
+            host=host,
+            port=port,
+            token=token,
+        )
         return
 
     ensure_directories()

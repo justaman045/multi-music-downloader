@@ -2,8 +2,42 @@
 
 Self-contained multi-account YouTube Music liked-music downloader. The entire
 application is a single script, `ytm-ll-dl-modern.py` (~7300 lines) at the repo
-root, plus `install.sh`/`run.sh`, `requirements.txt`, and `README.md`. There
-are no tests, linter, or CI. Verify changes by running the TUI.
+root, plus `install.sh`/`run.sh`, `requirements.txt`, `README.md`, and the
+`web/` package (a self-hosted local player UI). There are tests in `tests/`
+(pytest) run via CI, but no linter. Verify changes by running the TUI or the
+web server.
+
+## Web UI (`web/`)
+
+- `./run.sh serve [--port N] [--token T]` starts the SPA + JSON API on
+  `http://127.0.0.1:8765`. `--token` adds a bearer-token check to every
+  `/api/*` request (constant-time compare).
+- `web/server.py` is a plain `ThreadingHTTPServer` handler (no framework).
+  Routes: `/` + `/assets/*` (static SPA), `/api/health`, `/api/accounts`,
+  `/api/accounts/<slug>/refresh` (POST), `/api/library` (aggregated metadata
+  via `web/metadata.py`, cached), `/api/library/<slug>`, `/api/settings`
+  (GET/POST), `/api/downloads` (POST start / GET snapshot),
+  `/api/downloads/<slug>/stop|cancel`, `/api/downloads/cancel-all`,
+  `/api/most-played/<slug>[/<count>]`, `/api/duplicates`, `/api/backup`,
+  `/api/events` (SSE bus stream), `/api/art/<slug>/<video_id>.jpg` (album art,
+  cached in `files/<slug>/.art_cache/`), and
+  `/api/media/<slug>/<video_id>/stream` (Range-served audio; FLAC/WAV/AIFF are
+  transcoded to Opus via ffmpeg when `?format=opus`, and `?download=1` forces
+  a Content-Disposition attachment).
+- `web/downloads.py` runs the same `DownloadWorker` the TUI uses, routing its
+  events into a shared `EventBus` (`web/bus.py`) consumed via SSE. Session
+  snapshots live in `DownloadManager`; a session ends with
+  `finished=true`/`finished_info` (cancelled flag). Cancel is cooperative —
+  it stops new tracks/retries but doesn't kill a running yt-dlp subprocess.
+- `web/refresh.py` wraps the app's library-refresh path the same way.
+- The SPA (`web/static/index.html`, `styles.css`, `app.js`) is vanilla JS, no
+  build step; edit then reload the page. Verify JS syntax with
+  `node --check web/static/app.js`.
+- With `--token`, the gate only protects `/api/*`; static assets stay open so
+  the page can load. The SPA stores the token in `localStorage` (`ls-token`),
+  sends it as `Authorization: Bearer`, prompts on first 401, and appends
+  `?token=` to art/stream URLs (`withToken()` in app.js, applied in
+  `loadLibrary`).
 
 ## Running
 

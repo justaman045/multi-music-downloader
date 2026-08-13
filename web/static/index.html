@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YT Music Downloader</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path fill="currentColor" d="M12 3a9 9 0 0 0-9 9c0 2.4.94 4.59 2.47 6.2l.63-1.55A7.18 7.18 0 0 1 4.8 12a7.2 7.2 0 0 1 14.4 0 7.18 7.18 0 0 1-.3 4.65l.63 1.55A8.97 8.97 0 0 0 21 12a9 9 0 0 0-9-9zm0 4.5a4.5 4.5 0 0 0-4.5 4.5c0 1.24.5 2.36 1.31 3.17l.63-1.56A2.7 2.7 0 0 1 9.3 12a2.7 2.7 0 0 1 5.4 0 2.7 2.7 0 0 1-.14 1.61l.63 1.56A4.47 4.47 0 0 0 16.5 12 4.5 4.5 0 0 0 12 7.5z"/>
+            <circle cx="12" cy="12" r="1.5" fill="currentColor"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <strong>LocalSpot</strong>
+          <span>Music Downloader</span>
+        </div>
+      </div>
+
+      <nav id="main-nav">
+        <a href="#/home" data-route="home" class="nav-item">Home</a>
+        <a href="#/songs" data-route="songs" class="nav-item">All Songs</a>
+      </nav>
+
+      <div class="nav-group-label">Browse Library</div>
+      <nav id="browse-nav">
+        <a href="#/artists" data-route="artists" class="nav-item">
+          <span class="nav-ico"></span>Artists
+        </a>
+        <a href="#/albums" data-route="albums" class="nav-item">
+          <span class="nav-ico"></span>Albums
+        </a>
+        <a href="#/years" data-route="years" class="nav-item">
+          <span class="nav-ico"></span>Years
+        </a>
+        <a href="#/genres" data-route="genres" class="nav-item">
+          <span class="nav-ico"></span>Genres
+        </a>
+      </nav>
+
+      <div class="nav-group-label">Playlists &amp; Tools</div>
+      <nav id="tools-nav">
+        <a href="#/most-played" data-route="most-played" class="nav-item">Most Played</a>
+        <a href="#/duplicates" data-route="duplicates" class="nav-item">Duplicates</a>
+        <a href="#/status" data-route="status" class="nav-item">Library Status</a>
+        <a href="#/downloads" data-route="downloads" class="nav-item">
+          Downloads <span id="active-downloads-badge" class="badge hidden">0</span>
+        </a>
+      </nav>
+
+      <div class="nav-group-label">Accounts</div>
+      <div id="accounts-nav" class="accounts-nav"></div>
+      <nav id="system-nav">
+        <a href="#/accounts" data-route="accounts" class="nav-item">Accounts</a>
+        <a href="#/settings" data-route="settings" class="nav-item">Settings</a>
+      </nav>
+    </aside>
+
+    <main id="main">
+      <header id="topbar">
+        <div class="topbar-left">
+          <button id="btn-back" class="icon-btn" title="Back">&#8592;</button>
+          <button id="btn-refresh" class="icon-btn" title="Refresh library (r)">
+            &#8635;
+          </button>
+        </div>
+        <div class="topbar-title" id="topbar-title">Home</div>
+        <button id="btn-search" class="search-btn" title="Search (Ctrl/Cmd+K)">
+          <span>&#9906;</span> Search music
+        </button>
+      </header>
+      <div id="view"></div>
+    </main>
+
+    <footer id="player">
+      <div id="player-track">
+        <div id="player-art" class="player-art"></div>
+        <div class="player-meta">
+          <div id="player-title" class="player-title">Nothing playing</div>
+          <div id="player-artist" class="player-artist">—</div>
+        </div>
+      </div>
+      <div id="player-center">
+        <div class="player-controls">
+          <button id="btn-shuffle" class="ctl-btn" title="Shuffle">&#128256;</button>
+          <button id="btn-prev" class="ctl-btn" title="Previous">&#9198;</button>
+          <button id="btn-play" class="play-btn" title="Play/Pause (Space)">&#9654;</button>
+          <button id="btn-next" class="ctl-btn" title="Next">&#9197;</button>
+          <button id="btn-repeat" class="ctl-btn" title="Repeat">&#8634;</button>
+        </div>
+        <div class="player-seek">
+          <span id="cur-time">0:00</span>
+          <input id="seek" type="range" min="0" max="1000" value="0" />
+          <span id="dur-time">0:00</span>
+        </div>
+      </div>
+      <div id="player-right">
+        <span class="vol-ico">&#128266;</span>
+        <input id="volume" type="range" min="0" max="100" value="80" />
+      </div>
+    </footer>
+  </div>
+
+  <div id="search-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-search">
+        <span class="search-ico">&#9906;</span>
+        <input id="search-input" type="text" placeholder="Search songs, artists, albums…" autocomplete="off" />
+        <span id="search-esc" class="search-esc">Esc</span>
+      </div>
+      <div id="search-results" class="search-results"></div>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+  <div id="modal-root"></div>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

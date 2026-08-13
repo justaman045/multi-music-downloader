@@ -79,6 +79,29 @@ virtualenv holds the project-local yt-dlp/Deno/FFmpeg toolchain. Use
 ./run.sh --help      # show usage
 ```
 
+### Web UI (local Spotify-style player)
+
+Run the browser UI alongside or instead of the TUI:
+
+```bash
+./run.sh serve                 # http://127.0.0.1:8765
+./run.sh serve --port 9000     # custom port
+./run.sh serve --token <tok>   # require a bearer token in every API call
+```
+
+The web UI is a self-hosted local player for your downloaded music: browse
+by artist, album, year, or genre; stream any downloaded file (FLAC is
+transcoded to Opus for browsers that can't play it); search across all
+accounts; and trigger library refreshes / downloads — all without sending
+anything off-machine. When the server runs with `--token`, the UI prompts
+for the token on first load and remembers it.
+
+API endpoints are prefixed `/api/`: `/api/health`, `/api/accounts`,
+`/api/library`, `/api/most-played/<slug>`, `/api/media/<slug>/<video_id>/stream`,
+`/api/art/<slug>/<video_id>.jpg`, `/api/events` (Server-Sent Events for live
+download/refresh progress), plus POST handlers for refresh, downloads,
+duplicate removal, settings, and backup.
+
 ---
 
 ## First run: add an account
