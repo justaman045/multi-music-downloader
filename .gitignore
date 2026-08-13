@@ -1,0 +1,20 @@
+# Virtualenv
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# App data - contains secrets (auth headers/cookies) and downloads.
+# Never commit these.
+accounts/
+files/
+config/
+
+# Release archives
+*.zip
+
+# OS cruft
+.DS_Store
+Thumbs.db
