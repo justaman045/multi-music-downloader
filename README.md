@@ -154,8 +154,14 @@ app isn't running.
 
 ---
 
+## Roadmap
+
+- Spotify, Amazon Music, and Apple Music support
+- Search-and-download across all connected accounts
+- Your feature requests are welcome
+
 ## Notes
 
 - This is your own music; downloading your liked library is personal use.
-  Respect YouTube Music's terms of service.
-- No license is included; ask the author before reusing the code.
+  Respect each service's terms of use.
+- Licensed under the MIT License — see [LICENSE](LICENSE).
