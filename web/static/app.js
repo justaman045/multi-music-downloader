@@ -831,9 +831,9 @@ async function renderAlbums() {
   view.innerHTML = `
     <div class="section-head"><h2>Albums <span style="color:var(--text-faint);font-weight:600;font-size:14px">${albums.length}</span></h2></div>
     ${albums.length ? cardGridHTML(albums.map((a) => ({
-      title: a.title, art: a.art,
-      sub: `${a.artist} · ${a.year || "—"} · ${a.count} song${a.count === 1 ? "" : "s"}`,
-    })), (a) => `#/album/${encodeURIComponent(a.title + "###" + a.artist)}`) : empty("No albums yet.")}`;
+      title: a.title, artist: a.artist, art: a.art,
+      sub: `${a.artist || "—"} · ${a.year || "—"} · ${a.count} song${a.count === 1 ? "" : "s"}`,
+    })), (c) => `#/album/${encodeURIComponent(c.title + "###" + (c.artist || ""))}`) : empty("No albums yet.")}`;
 }
 
 async function renderYears() {
@@ -844,7 +844,7 @@ async function renderYears() {
       name: String(y.year),
       art: null,
       sub: `${y.count} song${y.count === 1 ? "" : "s"}`,
-    })), (y) => `#/year/${y.year}`) : empty("No year data yet — downloaded files carry year tags.")}`;
+    })), (c) => `#/year/${c.name}`) : empty("No year data yet — downloaded files carry year tags.")}`;
 }
 
 async function renderGenres() {
@@ -855,7 +855,7 @@ async function renderGenres() {
       name: g.genre,
       art: null,
       sub: `${g.count} song${g.count === 1 ? "" : "s"}`,
-    })), (g) => `#/genre/${encodeURIComponent(g.genre)}`) : empty("No genre data yet — downloaded files carry genre tags.")}`;
+    })), (c) => `#/genre/${encodeURIComponent(c.name)}`) : empty("No genre data yet — downloaded files carry genre tags.")}`;
 }
 
 async function renderArtist(name) {
@@ -1621,7 +1621,7 @@ const routes = {
 };
 
 async function navigate() {
-  const seq = ++state._renderSeq;
+  ++state._renderSeq;
   const hash = location.hash.replace(/^#\/?/, "");
   const [route, ...rest] = hash.split("/");
   const key = route || "home";
@@ -1647,7 +1647,10 @@ async function navigate() {
     if (key === "year" && rest[0]) return renderYear(Number(rest[0]));
     if (key === "genre" && rest[0]) return renderGenre(decodeURIComponent(rest[0]));
     const fn = routes[key];
-    if (fn) { await fn(); if (seq !== state._renderSeq) return; }
+    if (fn) {
+      await fn();
+      return;
+    }
     return renderHome();
   } catch (e) {
     view.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
