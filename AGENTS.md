@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Self-contained multi-account YouTube Music liked-music downloader. The entire
-application is a single script, `ytm-ll-dl-modern.py` (~7300 lines) at the repo
+application is a single script, `ytm-ll-dl-modern.py` (~7800 lines) at the repo
 root, plus `install.sh`/`run.sh`, `requirements.txt`, `README.md`, and the
 `web/` package (a self-hosted local player UI). There are tests in `tests/`
 (pytest) run via CI, but no linter. Verify changes by running the TUI or the
@@ -18,7 +18,9 @@ web server.
   via `web/metadata.py`, cached), `/api/library/<slug>`, `/api/settings`
   (GET/POST), `/api/downloads` (POST start / GET snapshot),
   `/api/downloads/<slug>/stop|cancel`, `/api/downloads/cancel-all`,
-  `/api/most-played/<slug>[/<count>]`, `/api/duplicates`, `/api/backup`,
+  `/api/most-played/<slug>[/<count>]`, `/api/duplicates`,
+  `/api/duplicates/export` (POST), `/api/accounts/<slug>/unliked`
+  (GET preview / POST purge), `/api/backup`,
   `/api/events` (SSE bus stream), `/api/art/<slug>/<video_id>.jpg` (album art,
   cached in `files/<slug>/.art_cache/`), and
   `/api/media/<slug>/<video_id>/stream` (Range-served audio; FLAC/WAV/AIFF are

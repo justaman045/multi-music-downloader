@@ -752,6 +752,12 @@ input[type="range"]::-moz-range-thumb {
 
 input[type="range"]:hover::-moz-range-thumb { opacity: 1; }
 
+@media (hover: none), (pointer: coarse) {
+  input[type="range"]::-webkit-slider-thumb,
+  input[type="range"]::-moz-range-thumb { opacity: 1; }
+  input[type="range"]::-webkit-slider-thumb { width: 16px; height: 16px; }
+}
+
 #player-right {
   display: flex;
   align-items: center;
@@ -759,7 +765,6 @@ input[type="range"]:hover::-moz-range-thumb { opacity: 1; }
   justify-content: flex-end;
 }
 
-.vol-ico { color: var(--text-dim); font-size: 16px; }
 #volume { max-width: 120px; }
 
 /* ==========================================================================
@@ -846,6 +851,7 @@ input[type="range"]:hover::-moz-range-thumb { opacity: 1; }
   flex-direction: column;
   gap: 10px;
   z-index: 200;
+  pointer-events: none;
 }
 
 .toast {
@@ -858,6 +864,8 @@ input[type="range"]:hover::-moz-range-thumb { opacity: 1; }
   font-size: 13px;
   max-width: 340px;
   animation: slide-in 0.25s ease;
+  pointer-events: auto;
+  cursor: default;
 }
 
 .toast.error { border-left-color: var(--danger); }
@@ -937,6 +945,18 @@ input[type="range"]:hover::-moz-range-thumb { opacity: 1; }
   margin-top: 10px;
   color: var(--text-dim);
   font-size: 12px;
+}
+
+.session-card.finished {
+  border-left: 4px solid var(--accent);
+}
+
+.session-failures {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  max-height: 260px;
+  overflow: auto;
 }
 
 /* ==========================================================================

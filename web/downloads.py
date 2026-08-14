@@ -126,8 +126,14 @@ class DownloadManager:
             snapshot["finished"] = True
             snapshot["finished_info"] = data
             snapshot["progress"] = 100.0
+            self._schedule_cleanup(slug, session_id)
             self.bus.broadcast(
-                {"type": "session_finished", "slug": slug, **data}
+                {
+                    "type": "session_finished",
+                    "slug": slug,
+                    "session_id": session_id,
+                    **data,
+                }
             )
 
         self.bus.broadcast(
@@ -136,6 +142,20 @@ class DownloadManager:
                 "session": snapshot,
             }
         )
+
+    def _schedule_cleanup(self, slug: str, session_id: str) -> None:
+        def _cleanup() -> None:
+            time.sleep(12)
+            with self._lock:
+                entry = self.workers.get(slug)
+                if entry and entry["session_id"] == session_id:
+                    del self.workers[slug]
+
+        threading.Thread(
+            target=_cleanup,
+            name=f"web-dl-cleanup-{slug}",
+            daemon=True,
+        ).start()
 
     def snapshot(self, slug: str | None = None) -> list[dict[str, Any]]:
         with self._lock:

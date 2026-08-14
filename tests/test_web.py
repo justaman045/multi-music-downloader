@@ -199,6 +199,20 @@ def test_settings_roundtrip_via_api(server, app):
     assert app.load_settings()["default_quality"] == "mp3_192"
 
 
+def test_duplicates_export(server, app):
+    _srv, port = server
+    status, _headers, data = request(
+        port,
+        "POST",
+        "/api/duplicates/export",
+        body=json.dumps({}),
+    )
+    assert status == 200
+    file = Path(json.loads(data)["file"])
+    assert file.exists()
+    assert file.parent == app.CONFIG_DIR / "exports"
+
+
 def test_download_start_requires_valid_account(server):
     _srv, port = server
     status, _headers, data = request(

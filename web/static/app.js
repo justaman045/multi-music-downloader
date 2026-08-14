@@ -21,12 +21,14 @@ const state = {
     playing: false,
     shuffle: false,
     repeat: "off",          // off | all | one
-    volume: 0.8,
+    volume: Math.max(0, Math.min(1, Number(localStorage.getItem("ls-volume") ?? 0.8))),
+    muted: localStorage.getItem("ls-muted") === "1",
     audio: new Audio(),
     lastVol: 0.8,
   },
   token: localStorage.getItem("ls-token") || "",
   _tokenPrompting: false,
+  _renderSeq: 0,
 };
 
 const QUALITIES = [
@@ -193,7 +195,21 @@ function modal(title, bodyHTML, actions = []) {
         </div>
       </div>`;
     root.classList.remove("hidden");
-    const close = (value) => { root.classList.add("hidden"); root.innerHTML = ""; resolve(value); };
+    const close = (value) => {
+      root.classList.add("hidden");
+      root.innerHTML = "";
+      root.dataset.open = "0";
+      document.removeEventListener("keydown", onKey, true);
+      resolve(value);
+    };
+    root.dataset.open = "1";
+    const onKey = (e) => {
+      if (e.key === "Escape" && root.dataset.open === "1") {
+        e.preventDefault();
+        close(null);
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
     $(".modal-bg", root).onclick = () => close(null);
     $$("button[data-a]", root).forEach((btn) => {
       btn.onclick = () => {
@@ -227,7 +243,7 @@ function confirmModal(title, body) {
 
 async function loadLibrary() {
   state.library = await api("/api/library");
-  state.refreshing = {};
+  state.refreshing = state.refreshing || {};
   if (state.token) {
     for (const t of state.library.tracks) {
       if (t.art) t.art = withToken(t.art);
@@ -331,26 +347,72 @@ function canPlayFlac() {
   return audio.canPlayType("audio/flac").length > 0;
 }
 
+function queueFor(tracks) {
+  const seen = new Set();
+  const queue = [];
+  for (const t of tracks) {
+    if (!t.stream) continue;
+    const key = t.id + "###" + t.account;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    queue.push(t);
+  }
+  return queue;
+}
+
 function setQueue(tracks, startIndex = 0) {
-  state.player.queue = tracks.filter((t) => t.stream);
+  state.player.queue = queueFor(tracks);
   state.player.index = -1;
-  if (state.player.queue.length) playIndex(startIndex);
+  if (!state.player.queue.length) {
+    stopPlayback("Nothing to play in this list");
+    return;
+  }
+  const clicked = tracks[startIndex] || tracks[0];
+  const idx = clicked
+    ? state.player.queue.findIndex((t) => t.id === clicked.id && t.account === clicked.account)
+    : 0;
+  playIndex(idx >= 0 ? idx : 0);
 }
 
 function playIndex(index) {
   if (index < 0 || index >= state.player.queue.length) return;
-  state.player.index = index;
+  const prev = state.player.queue[state.player.index];
   const track = state.player.queue[index];
+  const isSame = !!(prev && track && prev.id === track.id && prev.account === track.account);
+  state.player.index = index;
+  if (isSame) {
+    audio.currentTime = 0;
+    audio.play().then(() => { state.player.playing = true; }).catch(() => {});
+    updatePlayerUI();
+    return;
+  }
   audio.src = streamUrl(track);
-  audio.volume = state.player.volume;
-  audio.play().then(() => { state.player.playing = true; }).catch(() => {});
+  audio.volume = state.player.muted ? 0 : state.player.volume;
+  audio.play()
+    .then(() => { state.player.playing = true; })
+    .catch(() => { state.player.playing = false; });
+  updatePlayerUI();
+}
+
+function stopPlayback(message) {
+  audio.pause();
+  audio.removeAttribute("src");
+  audio.load();
+  state.player.queue = [];
+  state.player.index = -1;
+  state.player.playing = false;
+  if (message) toast(message, "info");
   updatePlayerUI();
 }
 
 function togglePlay() {
   if (state.player.index < 0) {
-    const first = visibleTracks().find((t) => t.stream);
-    if (first) setQueue(visibleTracks(), visibleTracks().indexOf(first));
+    const tracks = visibleTracks();
+    const queue = queueFor(tracks);
+    if (!queue.length) { stopPlayback("Nothing to play"); return; }
+    const first = queue[0];
+    const idx = tracks.findIndex((t) => t.id === first.id && t.account === first.account);
+    setQueue(tracks, idx >= 0 ? idx : 0);
     return;
   }
   if (audio.paused) {
@@ -365,6 +427,7 @@ function togglePlay() {
 function nextIndex() {
   const q = state.player.queue;
   if (!q.length) return -1;
+  if (state.player.index < 0) return 0;
   if (state.player.shuffle && q.length > 1) {
     let i;
     do { i = Math.floor(Math.random() * q.length); } while (i === state.player.index);
@@ -375,7 +438,7 @@ function nextIndex() {
 
 function prevIndex() {
   const q = state.player.queue;
-  if (!q.length) return -1;
+  if (!q.length || state.player.index < 0) return -1;
   if (audio.currentTime > 3) { audio.currentTime = 0; return state.player.index; }
   return (state.player.index - 1 + q.length) % q.length;
 }
@@ -409,7 +472,7 @@ audio.addEventListener("ended", () => {
 audio.addEventListener("timeupdate", () => {
   if (!audio.duration || isNaN(audio.duration)) return;
   const frac = (audio.currentTime / audio.duration) * 1000;
-  $("#seek").value = String(Math.round(frac));
+  if ($("#seek").dataset.seeking !== "1") $("#seek").value = String(Math.round(frac));
   $("#cur-time").textContent = fmtTime(audio.currentTime);
   $("#dur-time").textContent = fmtTime(audio.duration);
 });
@@ -442,15 +505,15 @@ function updatePlayerUI() {
   playBtn.title = state.player.playing ? "Pause (Space)" : "Play (Space)";
   $("#btn-shuffle").classList.toggle("active", state.player.shuffle);
   $("#btn-repeat").classList.toggle("active", state.player.repeat !== "off");
-  $$("table.tracks tbody tr").forEach((row) => {
-    row.classList.toggle("playing", track && row.dataset.id === track.id && state.scopeMatches && row.dataset.account === (track.account || ""));
-  });
+  $("#btn-mute").classList.toggle("active", state.player.muted);
+  $("#volume").value = String(Math.round(state.player.volume * 100));
   markPlayingRows(track);
 }
 
 function markPlayingRows(track) {
+  const inScope = !track || state.scope === "all" || track.account === state.scope;
   $$("table.tracks tbody tr").forEach((row) => {
-    row.classList.toggle("playing", !!track && row.dataset.id === track.id && row.dataset.account === track.account);
+    row.classList.toggle("playing", inScope && !!track && row.dataset.id === track.id && row.dataset.account === track.account);
   });
 }
 
@@ -474,22 +537,28 @@ async function startDownload(config) {
   return snapshot;
 }
 
-async function downloadDialog({ account, title = "Start download", bodyHTML = "" } = {}) {
+async function downloadDialog({ account, title = "Start download", bodyHTML = "", defaults = null } = {}) {
+  if (!defaults) {
+    try { defaults = await api("/api/settings"); } catch (e) { defaults = {}; }
+  }
+  const dq = QUALITIES.some(([v]) => v === defaults.default_quality) ? defaults.default_quality : "best";
+  const dp = defaults.default_existing_policy === "replace" ? "replace" : "skip";
+  const ds = ["once", "loop", "skip"].includes(defaults.default_session) ? defaults.default_session : "loop";
   const value = await modal(title, `
     <div class="label">Audio quality</div>
     <select name="quality" class="input">
-      ${QUALITIES.map(([v, l]) => `<option value="${v}" ${v === "mp3_320" ? "selected" : ""}>${esc(l)}</option>`).join("")}
+      ${QUALITIES.map(([v, l]) => `<option value="${v}" ${v === dq ? "selected" : ""}>${esc(l)}</option>`).join("")}
     </select>
     <div class="label">If audio already exists</div>
     <select name="policy" class="input">
-      <option value="skip">Skip existing file</option>
-      <option value="replace">Replace existing file</option>
+      <option value="skip" ${dp === "skip" ? "selected" : ""}>Skip existing file</option>
+      <option value="replace" ${dp === "replace" ? "selected" : ""}>Replace existing file</option>
     </select>
     <div class="label">Session</div>
     <select name="session" class="input">
-      <option value="once">Run the whole list once</option>
-      <option value="loop">Loop until stopped</option>
-      <option value="skip">Download missing across all qualities</option>
+      <option value="once" ${ds === "once" ? "selected" : ""}>Run the whole list once</option>
+      <option value="loop" ${ds === "loop" ? "selected" : ""}>Loop until stopped</option>
+      <option value="skip" ${ds === "skip" ? "selected" : ""}>Download missing across all qualities</option>
     </select>
     ${bodyHTML}
     <p style="margin-top:14px;color:var(--text-faint);font-size:12px">
@@ -593,6 +662,10 @@ function trackTable(tracks, opts = {}) {
     </div>`;
 }
 
+function currentTrack() {
+  return state.player.queue[state.player.index];
+}
+
 function bindTrackTable(container, allTracks) {
   const table = $("table.tracks", container);
   if (table) {
@@ -636,6 +709,8 @@ function bindTrackTable(container, allTracks) {
       bindTrackTable(container, filtered);
     };
   }
+
+  markPlayingRows(currentTrack());
 
   const downloadBtn = $("#download-view", container);
   if (downloadBtn) {
@@ -896,7 +971,11 @@ async function renderMostPlayed() {
     view.innerHTML = `<div class="alert alert-info">Select an account in the sidebar to see its most-played chart.</div>`;
     return;
   }
+  const seq = state._renderSeq;
   const data = await api(`/api/most-played/${state.scope}`);
+  if (seq !== state._renderSeq) return;
+  let defaultQuality = "mp3_320";
+  try { defaultQuality = (await api("/api/settings")).default_quality || defaultQuality; } catch (e) { /* keep fallback */ }
   const tracks = data.report.tracks || [];
   const rows = tracks.map((t, i) => `
     <tr data-id="${esc(t.video_id)}">
@@ -917,7 +996,7 @@ async function renderMostPlayed() {
         <div class="label" style="margin:0">Download top</div>
         <input id="mp-count" class="input" type="number" min="1" max="100" value="25" style="width:90px" />
         <select id="mp-quality" class="input" style="width:auto">
-          ${QUALITIES.map(([v, l]) => `<option value="${v}" ${v === "mp3_320" ? "selected" : ""}>${esc(l)}</option>`).join("")}
+          ${QUALITIES.map(([v, l]) => `<option value="${v}" ${v === defaultQuality ? "selected" : ""}>${esc(l)}</option>`).join("")}
         </select>
         <button id="mp-download" class="btn btn-primary">&#8681; Download</button>
         <button id="mp-refresh" class="btn btn-ghost">&#8635; Re-fetch history</button>
@@ -944,12 +1023,26 @@ async function renderMostPlayed() {
       renderMostPlayed();
     } catch (e) { toast(e.message, "error"); }
   };
+
+  const libTracks = state.library ? state.library.tracks.filter((t) => t.account === state.scope) : [];
+  $$("#view table.tracks tbody tr", view).forEach((row) => {
+    row.onclick = () => {
+      const track = libTracks.find((t) => t.id === row.dataset.id);
+      if (!track) return;
+      if (!track.stream) { toast(`"${track.title}" isn't downloaded yet`, "info"); return; }
+      const tracks = libTracks.filter((t) => t.stream);
+      const idx = tracks.findIndex((t) => t.id === track.id);
+      if (idx >= 0) setQueue(tracks, idx);
+    };
+  });
 }
 
 async function renderDuplicates() {
   view.innerHTML = spinner();
   try {
+    const seq = state._renderSeq;
     const data = await api("/api/duplicates");
+    if (seq !== state._renderSeq) return;
     const report = data.report || {};
     const candidates = data.candidates || [];
     const exact = report.exact || [];
@@ -970,6 +1063,7 @@ async function renderDuplicates() {
       </div>
       <div class="filter-bar">
         <button id="dup-remove" class="btn btn-danger" disabled>&#128465; Remove selected</button>
+        <button id="dup-export" class="btn btn-ghost">&#8681; Export report</button>
         <button id="dup-rescan" class="btn btn-ghost">&#8635; Rescan</button>
       </div>`;
 
@@ -1039,12 +1133,20 @@ async function renderDuplicates() {
     };
 
     $("#dup-rescan").onclick = () => { renderDuplicates(); };
+
+    $("#dup-export").onclick = async () => {
+      try {
+        const r = await api("/api/duplicates/export", { method: "POST", body: {} });
+        toast(`Duplicate report saved to ${r.file}`, "success");
+      } catch (e) { toast(e.message, "error"); }
+    };
   } catch (e) {
     view.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
   }
 }
 
 async function renderStatus() {
+  const seq = state._renderSeq;
   view.innerHTML = spinner();
   const targets = state.scope === "all" && state.library
     ? state.library.accounts.map((a) => a.slug)
@@ -1055,6 +1157,7 @@ async function renderStatus() {
   for (const slug of targets) {
     let status = {};
     try { status = await api(`/api/status/${slug}`); } catch (e) {}
+    if (seq !== state._renderSeq) return;
     const counts = status.counts || {};
 
     html += `
@@ -1066,6 +1169,10 @@ async function renderStatus() {
               <div class="stat-value" style="font-size:20px">${counts[k] ?? 0}</div>
               <div class="stat-label">${label}</div>
             </div>`).join("")}
+        </div>
+        <div class="filter-bar" style="margin-top:12px">
+          <button class="btn btn-ghost" data-act="repair" data-slug="${esc(slug)}">&#10003; Repair downloads</button>
+          <button class="btn btn-ghost" data-act="purge" data-slug="${esc(slug)}">&#128465; Purge no-longer-liked</button>
         </div>
       </div>`;
 
@@ -1091,38 +1198,129 @@ async function renderStatus() {
   }
 
   view.innerHTML = html;
+
+  $$("[data-act]", view).forEach((btn) => {
+    btn.onclick = () => {
+      if (btn.dataset.act === "repair") repairDialog(btn.dataset.slug);
+      else purgeDialog(btn.dataset.slug);
+    };
+  });
+}
+
+async function repairDialog(slug) {
+  const config = await modal("Repair downloads", `
+    <p>Re-download every currently-liked track in <strong>${esc(slug)}</strong> that has no playable file at the chosen quality. Files that already exist are left alone.</p>
+    <div class="label">Quality to repair</div>
+    <select name="quality" class="input">
+      ${QUALITIES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join("")}
+    </select>`,
+    [
+      { label: "Cancel", value: () => false },
+      {
+        label: "Repair",
+        variant: "btn-primary",
+        value: () => ({ quality: $("#modal-root select[name=quality]").value }),
+      },
+    ]);
+  if (!config) return;
+  try {
+    await startDownload({
+      account: slug,
+      quality: config.quality,
+      existing_policy: "skip",
+      session: "once",
+      output: "repair",
+    });
+    toast("Repair download started", "info");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function purgeDialog(slug) {
+  let items = [];
+  try { items = await api(`/api/accounts/${slug}/unliked`); } catch (e) { toast(e.message, "error"); return; }
+  if (!items.length) { toast("No no-longer-liked files to purge", "info"); return; }
+  const totalBytes = items.reduce((s, i) => s + (i.size_bytes || 0), 0);
+  const ok = await modal("Purge no-longer-liked files", `
+    <p><strong>${items.length}</strong> track${items.length === 1 ? "" : "s"} were downloaded but are no longer in Liked Music. Their local files (${fmtSize(totalBytes)}) will be deleted.</p>
+    <div style="max-height:280px;overflow:auto;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:6px 12px">
+      ${items.slice(0, 40).map((i) => `
+        <div class="check-row"><span style="flex:1;min-width:0">
+          <strong>${esc(i.title)}</strong> — <span style="color:var(--text-dim)">${esc(i.artist)}</span>
+          <span style="color:var(--text-faint);font-size:12px">(${fmtSize(i.size_bytes || 0)})</span>
+        </span></div>`).join("")}
+    </div>
+    ${items.length > 40 ? `<p style="color:var(--text-faint);font-size:12px">+${items.length - 40} more</p>` : ""}`,
+    [
+      { label: "Cancel", value: () => false },
+      { label: "Delete files", variant: "btn-danger", value: () => true },
+    ]);
+  if (!ok) return;
+  try {
+    const result = await api(`/api/accounts/${slug}/unliked`, {
+      method: "POST",
+      body: { video_ids: items.map((i) => i.video_id) },
+    });
+    const freed = result.freed_bytes || 0;
+    toast(`Purged ${result.video_ids.length} track${result.video_ids.length === 1 ? "" : "s"}, freed ${fmtSize(freed)}`, "success");
+    renderStatus();
+    loadLibrary();
+  } catch (e) { toast(e.message, "error"); }
 }
 
 async function renderDownloads() {
   const sessions = Object.values(state.downloads);
   view.innerHTML = `
-    <div class="section-head"><h2>Downloads</h2></div>
+    <div class="section-head"><h2>Downloads</h2>
+      ${sessions.length ? `<button id="dl-cancel-all" class="btn btn-danger" style="float:right">&#10005; Cancel all</button>` : ""}
+    </div>
     ${sessions.length ? "" : `<div class="empty-state"><div class="big">&#8681;</div>No active download sessions. Start one from any song list or the download buttons.</div>`}`;
 
   sessions.forEach((s) => {
     const counts = s.counts || {};
+    const fin = s.finished_info || {};
+    const failedRes = (fin.results || []).filter((r) => r.status === "failed");
+    const failedIds = [...new Set(failedRes.map((r) => r.video_id))].filter(Boolean);
     const node = document.createElement("div");
-    node.className = "session-card";
+    node.className = `session-card${s.finished ? " finished" : ""}`;
     node.id = `session-${s.slug}`;
     node.innerHTML = `
       <div class="session-head">
         <div>
           <div class="session-title">${esc(s.name)} <span class="slug">${s.quality || ""}</span></div>
           <div class="session-meta">
-            ${s.track ? `${s.track.number}/${s.track.total} — ${esc(s.track.title)}` : "Starting…"}
+            ${s.finished
+              ? `${s.finished_info?.cancelled ? "Cancelled" : "Finished"} — ${fin.downloaded || 0} downloaded, ${fin.skipped || 0} skipped, ${fin.failed || 0} failed`
+              : (s.track ? `${s.track.number}/${s.track.total} — ${esc(s.track.title)}` : "Starting…")}
           </div>
         </div>
-        <div class="session-title">${Math.round(s.progress)}%</div>
+        <div class="session-title">${s.finished ? (s.finished_info?.cancelled ? "Stopped" : "Done") : Math.round(s.progress) + "%"}</div>
       </div>
       <div class="progress-track"><div class="progress-fill" style="width:${Math.max(0, Math.min(100, s.progress))}%"></div></div>
       <div class="session-footer">
         <span>D:${counts.downloaded || 0} S:${counts.skipped || 0} F:${counts.failed || 0} U:${counts.unavailable || 0}</span>
         <span>
-          <button class="btn btn-ghost" style="padding:6px 14px;font-size:12px" data-act="stop" data-slug="${esc(s.slug)}">Stop after stage</button>
-          <button class="btn btn-danger" style="padding:6px 14px;font-size:12px" data-act="cancel" data-slug="${esc(s.slug)}">Cancel</button>
+          ${failedIds.length ? `<button class="btn btn-ghost" style="padding:6px 14px;font-size:12px" data-act="retry" data-slug="${esc(s.slug)}" data-quality="${esc(s.quality || "best")}">&#8635; Retry ${failedIds.length} failed</button>` : ""}
+          ${s.finished ? "" : `<button class="btn btn-ghost" style="padding:6px 14px;font-size:12px" data-act="stop" data-slug="${esc(s.slug)}">Stop after stage</button>`}
+          ${s.finished ? "" : `<button class="btn btn-danger" style="padding:6px 14px;font-size:12px" data-act="cancel" data-slug="${esc(s.slug)}">Cancel</button>`}
         </span>
       </div>`;
+    if (failedRes.length) {
+      const show = failedRes.slice(0, 8);
+      const more = failedRes.length - show.length;
+      const list = document.createElement("div");
+      list.className = "session-failures";
+      list.innerHTML = show.map((r) => `<div class="check-row"><span style="flex:1;min-width:0"><strong>${esc(r.title)}</strong> — <span style="color:var(--text-dim)">${esc(r.artist)}</span><span style="color:var(--text-faint);display:block;font-size:12px">${esc(r.reason || "")}</span></span></div>`).join("")
+        + (more > 0 ? `<div class="dup-title" style="padding:6px 0">…and ${more} more</div>` : "");
+      node.appendChild(list);
+    }
     view.appendChild(node);
+  });
+
+  $("#dl-cancel-all")?.addEventListener("click", async () => {
+    try {
+      await api("/api/downloads/cancel-all", { method: "POST", body: {} });
+      toast("Cancelling all sessions…", "info");
+    } catch (e) { toast(e.message, "error"); }
   });
 
   $$("[data-act]", view).forEach((btn) => {
@@ -1130,6 +1328,14 @@ async function renderDownloads() {
       const slug = btn.dataset.slug;
       const act = btn.dataset.act;
       try {
+        if (act === "retry") {
+          const fin2 = state.downloads[slug]?.finished_info || {};
+          const ids = [...new Set((fin2.results || []).filter((r) => r.status === "failed").map((r) => r.video_id))].filter(Boolean);
+          if (!ids.length) return;
+          await startDownload({ account: slug, quality: btn.dataset.quality, existing_policy: "skip", session: "once", video_ids: ids });
+          toast(`Retrying ${ids.length} failed track${ids.length === 1 ? "" : "s"}…`, "info");
+          return;
+        }
         await api(`/api/downloads/${slug}/${act}`, { method: "POST", body: {} });
         toast(act === "stop" ? "Stopping after current stage…" : "Cancelling…", "info");
       } catch (e) { toast(e.message, "error"); }
@@ -1389,6 +1595,10 @@ function renderSearchResults(query) {
       if (idx >= 0) setQueue(all, idx);
     };
   });
+
+  box.onclick = (e) => {
+    if (e.target.closest("a")) closeSearch();
+  };
 }
 
 /* -------------------------------------------------------------------------
@@ -1411,6 +1621,7 @@ const routes = {
 };
 
 async function navigate() {
+  const seq = ++state._renderSeq;
   const hash = location.hash.replace(/^#\/?/, "");
   const [route, ...rest] = hash.split("/");
   const key = route || "home";
@@ -1436,7 +1647,7 @@ async function navigate() {
     if (key === "year" && rest[0]) return renderYear(Number(rest[0]));
     if (key === "genre" && rest[0]) return renderGenre(decodeURIComponent(rest[0]));
     const fn = routes[key];
-    if (fn) return fn();
+    if (fn) { await fn(); if (seq !== state._renderSeq) return; }
     return renderHome();
   } catch (e) {
     view.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
@@ -1488,8 +1699,29 @@ function renderRefreshUI() {
  * ---------------------------------------------------------------------- */
 
 function connectEvents() {
-  const source = new EventSource("/api/events");
+  const url = state.token ? `/api/events?token=${encodeURIComponent(state.token)}` : "/api/events";
+  const source = new EventSource(url);
+  let pollTimer = null;
+
+  const stopPolling = () => {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  };
+
+  const startPolling = () => {
+    if (pollTimer) return;
+    pollTimer = setInterval(async () => {
+      try {
+        const snapshot = await api("/api/downloads");
+        state.downloads = {};
+        (snapshot || []).forEach((s) => { state.downloads[s.slug] = s; });
+        renderDownloadsBadge();
+        if (state.route === "downloads") renderDownloads();
+      } catch (e) { /* keep polling */ }
+    }, 5000);
+  };
+
   source.onmessage = (event) => {
+    stopPolling();
     let data;
     try { data = JSON.parse(event.data); } catch (e) { return; }
 
@@ -1513,8 +1745,10 @@ function connectEvents() {
 
     if (data.type === "session_finished") {
       const slug = data.slug;
+      const sid = data.session_id;
       setTimeout(() => {
-        delete state.downloads[slug];
+        const cur = state.downloads[slug];
+        if (cur && cur.session_id === sid) delete state.downloads[slug];
         renderDownloadsBadge();
         if (state.route === "downloads") renderDownloads();
       }, 8000);
@@ -1538,7 +1772,11 @@ function connectEvents() {
       toast(`${data.slug}: refresh failed — ${data.error}`, "error");
     }
   };
-  source.onerror = () => { /* auto-reconnect by EventSource */ };
+  source.onerror = () => {
+    if (source.readyState !== EventSource.CLOSED) return;
+    stopPolling();
+    startPolling();
+  };
 }
 
 /* -------------------------------------------------------------------------
@@ -1556,9 +1794,9 @@ function wirePlayer() {
   };
 
   const seek = $("#seek");
-  let seeking = false;
-  seek.addEventListener("pointerdown", () => { seeking = true; });
-  seek.addEventListener("pointerup", () => { seeking = false; });
+  seek.addEventListener("pointerdown", () => { seek.dataset.seeking = "1"; });
+  seek.addEventListener("pointerup", () => { seek.dataset.seeking = "0"; });
+  seek.addEventListener("pointerleave", () => { seek.dataset.seeking = "0"; });
   seek.addEventListener("input", () => {
     if (!audio.duration) return;
     audio.currentTime = (Number(seek.value) / 1000) * audio.duration;
@@ -1569,8 +1807,25 @@ function wirePlayer() {
   vol.addEventListener("input", () => {
     const v = Number(vol.value) / 100;
     state.player.volume = v;
-    audio.volume = v;
+    state.player.muted = v === 0;
+    localStorage.setItem("ls-volume", String(v));
+    localStorage.setItem("ls-muted", state.player.muted ? "1" : "0");
+    audio.volume = state.player.muted ? 0 : v;
   });
+
+  $("#btn-mute").onclick = () => {
+    state.player.muted = !state.player.muted;
+    if (state.player.muted) {
+      audio.volume = 0;
+      if (state.player.volume > 0) state.player.lastVol = state.player.volume;
+    } else {
+      state.player.volume = state.player.volume > 0 ? state.player.volume : (state.player.lastVol || 0.8);
+      audio.volume = state.player.volume;
+      vol.value = String(Math.round(state.player.volume * 100));
+    }
+    localStorage.setItem("ls-muted", state.player.muted ? "1" : "0");
+    updatePlayerUI();
+  };
 }
 
 /* -------------------------------------------------------------------------
@@ -1615,6 +1870,9 @@ document.addEventListener("keydown", (e) => {
       downloadDialog({ account: state.scope }).then((c) => c && startDownload(c));
     }
   } else if (e.key.toLowerCase() === "m") {
+    e.preventDefault();
+    $("#btn-mute").click();
+  } else if (e.key === "M") {
     location.hash = "#/most-played";
   } else if (e.key.toLowerCase() === "s") {
     location.hash = "#/status";

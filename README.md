@@ -29,6 +29,12 @@ challenges), and FFmpeg. No system-wide installs are required.
   unliked tracks, and failed/skipped tracks with reasons.
 - **Most Played** — music-stats summary of your liked library.
 - **Cross-account duplicate detection** with one-click removal.
+- **Repair downloads** — re-download any currently-liked track that is
+  missing or failed at the chosen quality.
+- **Purge no-longer-liked** — remove local files and inventory records for
+  songs that were unliked on YouTube Music.
+- **Session results** — every finished download session reports per-track
+  outcomes with one-click retry of the failed ones.
 - **Persistent JSON reports** for everything.
 - **Self-contained runtime** — project-local yt-dlp, Deno, and FFmpeg.
 
@@ -100,7 +106,8 @@ API endpoints are prefixed `/api/`: `/api/health`, `/api/accounts`,
 `/api/library`, `/api/most-played/<slug>`, `/api/media/<slug>/<video_id>/stream`,
 `/api/art/<slug>/<video_id>.jpg`, `/api/events` (Server-Sent Events for live
 download/refresh progress), plus POST handlers for refresh, downloads,
-duplicate removal, settings, and backup.
+duplicate removal/export, settings, backup, and per-account unliked preview
+and purge.
 
 ---
 
@@ -129,7 +136,8 @@ The headers (including your session cookies) are stored locally in
 - **Most Played** (`m`) — browse play/album statistics for your library.
 - **Duplicates** (`u`) — find the same track downloaded for multiple
   accounts and remove duplicates with one click.
-- **Library Status** (`s`) — snapshot of the last refresh scan.
+- **Library Status** (`s`) — snapshot of the last refresh scan, with
+  **Repair Downloads** and **Purge Unliked** actions.
 - **Settings** (`p`) — change default quality / existing-file policy.
 - **Remove** — delete an account and its local data.
 
@@ -142,7 +150,7 @@ temp files first, then are renamed to their final tagged filename.
 
 | Path | Purpose |
 | --- | --- |
-| `ytm-ll-dl-modern.py` | The entire application (~7300 lines, single file). |
+| `ytm-ll-dl-modern.py` | The entire application (~7800 lines, single file). |
 | `install.sh` / `run.sh` | Setup and launcher scripts. |
 | `requirements.txt` | Pinned Python dependencies. |
 | `venv/` | Project-local Python environment + yt-dlp/Deno binaries (created by `install.sh`). |

@@ -60,8 +60,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "4.0.0"
-APP_BUILD = "2026-08-13-web-ui-local-spotify"
+APP_VERSION = "5.0.0"
+APP_BUILD = "2026-08-14-polish-playback-web-tui-parity"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -1272,6 +1272,93 @@ def inventory_current_tracks(
         )
 
     return tracks
+
+
+def repair_pending_tracks(
+    account: dict[str, Any],
+    quality: str,
+) -> list[dict[str, Any]]:
+    """
+    Currently-liked tracks with no healthy file at the given
+    quality (never downloaded, failed, missing, or unavailable).
+    Used to rebuild a quality tier without re-downloading files
+    that are already present and playable.
+    """
+    with account_inventory_lock(
+        account["slug"]
+    ):
+        inventory = load_inventory(
+            account
+        )
+
+    quality_dir = quality_directory(
+        account,
+        quality,
+    )
+
+    pending = []
+
+    for video_id, record in (
+        inventory["tracks"].items()
+    ):
+        if not record.get(
+            "currently_liked"
+        ):
+            continue
+
+        album = record.get("album")
+
+        track = {
+            "videoId": video_id,
+            "title": record.get(
+                "title",
+                "Unknown Title",
+            ),
+            "artists": [
+                {
+                    "name": record.get(
+                        "artist",
+                        "Unknown Artist",
+                    )
+                }
+            ],
+            "album": (
+                {"name": album}
+                if album
+                else None
+            ),
+        }
+
+        expected = find_existing_quality_file(
+            track,
+            quality_dir,
+            quality,
+        )
+
+        recorded_file = (
+            record.get("qualities") or {}
+        ).get(quality, {}).get(
+            "file"
+        )
+
+        if expected is None and recorded_file:
+            recorded_path = Path(
+                recorded_file
+            )
+
+            if recorded_path.exists():
+                expected = recorded_path
+
+        if (
+            expected is not None
+            and expected.exists()
+            and expected.stat().st_size > 0
+        ):
+            continue
+
+        pending.append(track)
+
+    return pending
 
 
 def status_file(
@@ -2501,6 +2588,116 @@ def _purge_unliked_tracks(
     return deleted_by_video
 
 
+def unliked_inventory_records(
+    account: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Inventory records for uploads no longer in Liked Music, with
+    the local files that would be freed by a purge. Read-only.
+    """
+    with account_inventory_lock(
+        account["slug"]
+    ):
+        inventory = load_inventory(
+            account
+        )
+
+    items = []
+
+    for video_id, record in (
+        inventory["tracks"].items()
+    ):
+        if record.get(
+            "currently_liked",
+            True,
+        ):
+            continue
+
+        files = []
+
+        for quality_record in (
+            record.get("qualities") or {}
+        ).values():
+            file = quality_record.get(
+                "file"
+            )
+
+            if not file:
+                continue
+
+            path = Path(file)
+
+            if path.exists():
+                files.append(
+                    {
+                        "path": str(path),
+                        "size_bytes": path.stat().st_size,
+                    }
+                )
+
+        if not files:
+            continue
+
+        items.append(
+            {
+                "video_id": video_id,
+                "title": record.get(
+                    "title",
+                    "Unknown",
+                ),
+                "artist": record.get(
+                    "artist",
+                    "Unknown",
+                ),
+                "files": files,
+                "size_bytes": sum(
+                    entry["size_bytes"]
+                    for entry in files
+                ),
+            }
+        )
+
+    items.sort(
+        key=lambda item: (
+            item["title"].lower()
+        )
+    )
+
+    return items
+
+
+def purge_unliked_records(
+    account: dict[str, Any],
+    video_ids: list[str],
+) -> dict[str, Any]:
+    """
+    Delete local files + inventory records for uploads that were
+    confirmed unliked. Returns per-video deletion summary.
+    """
+    sizes_by_id = {
+        item["video_id"]: item["size_bytes"]
+        for item in unliked_inventory_records(
+            account
+        )
+    }
+
+    deleted = _purge_unliked_tracks(
+        account,
+        video_ids,
+    )
+
+    return {
+        "video_ids": sorted(
+            set(video_ids)
+        ),
+        "deleted_files": deleted,
+        "freed_bytes": sum(
+            sizes_by_id.get(video_id, 0)
+            for video_id in set(video_ids)
+        ),
+    }
+
+
 # ============================================================================
 # Exports / backups
 # ============================================================================
@@ -2799,6 +2996,7 @@ class DownloadWorker:
                 stop=self._stop,
                 total=len(self.tracks),
                 error=str(error),
+                results=self.results,
             )
 
     def _run(self) -> None:
@@ -2837,6 +3035,7 @@ class DownloadWorker:
             cancelled=self.cancelled,
             stop=self._stop,
             total=len(self.tracks),
+            results=self.results,
         )
 
     def run_stage(
@@ -4631,6 +4830,14 @@ class LibraryStatusScreen(ModalScreen):
 
             Horizontal(
                 Button(
+                    "Repair Downloads",
+                    id="repair",
+                ),
+                Button(
+                    "Purge Unliked",
+                    id="purge",
+                ),
+                Button(
                     "Close",
                     id="close",
                 ),
@@ -4646,6 +4853,228 @@ class LibraryStatusScreen(ModalScreen):
     ) -> None:
         if event.button.id == "close":
             self.dismiss(None)
+            return
+
+        if event.button.id == "repair":
+            pending = repair_pending_tracks(
+                self.account,
+                self.quality,
+            )
+
+            if not pending:
+                self.app.notify(
+                    "Nothing to repair \u2014 every liked track "
+                    "already has a file at this quality.",
+                    severity="information",
+                )
+                return
+
+            self.dismiss(None)
+
+            self.app.start_download(
+                self.account,
+                pending,
+                DownloadSession(
+                    quality=self.quality,
+                    existing_policy="skip",
+                    session="once",
+                ),
+            )
+
+            self.app.notify(
+                (
+                    f"Repairing {len(pending)} track(s) at "
+                    f"{quality_label(self.quality)} \u2026"
+                ),
+                severity="information",
+            )
+            return
+
+        if event.button.id == "purge":
+            unliked = unliked_inventory_records(
+                self.account
+            )
+
+            if not unliked:
+                self.app.notify(
+                    "No no-longer-liked files to purge.",
+                    severity="information",
+                )
+                return
+
+            self.dismiss(None)
+
+            self.app.push_screen(
+                PurgeUnlikedScreen(
+                    self.account,
+                    unliked,
+                )
+            )
+
+
+# ============================================================================
+# Purge unliked modal
+# ============================================================================
+
+class PurgeUnlikedScreen(ModalScreen):
+    CSS = """
+    PurgeUnlikedScreen {
+        align: center middle;
+    }
+
+    #modal {
+        width: 80%;
+        height: 80%;
+        background: $surface;
+        border: double $error;
+        padding: 2;
+    }
+
+    #title {
+        color: $error;
+        text-style: bold;
+        padding-bottom: 1;
+    }
+
+    #summary {
+        height: auto;
+        padding-bottom: 1;
+    }
+
+    #content {
+        height: 1fr;
+        overflow-y: auto;
+        border: solid $secondary;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+
+    #content .entry {
+        height: auto;
+        padding-bottom: 1;
+    }
+
+    #buttons {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #buttons Button {
+        margin-right: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        account: dict[str, Any],
+        unliked: list[dict[str, Any]],
+    ):
+        super().__init__()
+        self.account = account
+        self.unliked = unliked
+
+    def compose(self) -> ComposeResult:
+        total_bytes = sum(
+            item["size_bytes"]
+            for item in self.unliked
+        )
+
+        preview = self.unliked[:30]
+
+        lines = []
+
+        for item in preview:
+            lines.extend(
+                [
+                    (
+                        f"\u2022 {item['artist']} \u2014 "
+                        f"{item['title']} "
+                        f"({format_size(item['size_bytes'])})"
+                    )
+                ]
+            )
+
+        if len(self.unliked) > len(preview):
+            lines.append(
+                f"\u2026 and "
+                f"{len(self.unliked) - len(preview)} more."
+            )
+
+        yield Container(
+            Label(
+                "PURGE UNLIKED",
+                id="title",
+            ),
+            Static(
+                (
+                    f"{len(self.unliked)} track(s) were downloaded "
+                    f"but are no longer in Liked Music. Deleting their "
+                    f"local files frees {format_size(total_bytes)}.\n"
+                ),
+                id="summary",
+            ),
+            VerticalScroll(
+                *[
+                    Static(
+                        "\n".join(lines),
+                        classes="entry",
+                    )
+                ],
+                id="content",
+            ),
+            Horizontal(
+                Button(
+                    "Cancel",
+                    id="cancel",
+                ),
+                Button(
+                    "Delete Files",
+                    id="delete",
+                    variant="error",
+                ),
+                id="buttons",
+            ),
+            id="modal",
+        )
+
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+
+        if event.button.id != "delete":
+            return
+
+        video_ids = [
+            item["video_id"]
+            for item in self.unliked
+        ]
+
+        try:
+            result = purge_unliked_records(
+                self.account,
+                video_ids,
+            )
+        except Exception as error:
+            self.app.notify(
+                f"Purge failed: {error}",
+                severity="error",
+            )
+            return
+
+        self.dismiss(None)
+
+        self.app.notify(
+            (
+                f"Purged {len(result['video_ids'])} track(s), "
+                f"freed {format_size(result['freed_bytes'])}."
+            ),
+            severity="success",
+            timeout=8,
+        )
 
 
 # ============================================================================
@@ -6981,6 +7410,9 @@ class YTMusicDownloader(App):
                     f"Skipped: {data['skipped']}\n"
                     f"Failed: {data['failed']}\n"
                     f"Unavailable: {data['unavailable']}"
+                )
+                + self._failed_titles_summary(
+                    data.get("results", [])
                 ),
                 severity="information",
                 timeout=12,
@@ -6989,6 +7421,37 @@ class YTMusicDownloader(App):
     # ------------------------------------------------------------------
     # Active sessions display
     # ------------------------------------------------------------------
+
+    def _failed_titles_summary(
+        self,
+        results: list[dict[str, Any]],
+    ) -> str:
+        failed = [
+            result
+            for result in results
+            if result.get("status") == "failed"
+        ]
+
+        if not failed:
+            return ""
+
+        shown = failed[:5]
+        more = len(failed) - len(shown)
+
+        lines = ["", "Failed tracks:"]
+
+        for result in shown:
+            lines.append(
+                f"  \u2022 {result['artist']} \u2014 "
+                f"{result['title']}"
+            )
+
+        if more > 0:
+            lines.append(
+                f"  \u2026 and {more} more."
+            )
+
+        return "\n".join(lines)
 
     def inventory_lock(
         self,

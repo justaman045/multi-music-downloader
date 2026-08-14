@@ -241,14 +241,24 @@ class WebHandler(BaseHTTPRequestHandler):
             return
 
         if head == "accounts":
-            accounts = [
-                {
-                    "slug": account["slug"],
-                    "name": account.get("name", account["slug"]),
-                }
-                for account in web.app.get_accounts()
-            ]
-            self._send_json(accounts)
+            if len(parts) == 1:
+                accounts = [
+                    {
+                        "slug": account["slug"],
+                        "name": account.get("name", account["slug"]),
+                    }
+                    for account in web.app.get_accounts()
+                ]
+                self._send_json(accounts)
+                return
+            if len(parts) == 3 and parts[2] == "unliked":
+                account = web.account(parts[1])
+                if account is None:
+                    self._send_error(404, "Unknown account")
+                    return
+                self._send_json(web.app.unliked_inventory_records(account))
+                return
+            self._send_error(404, "Not found")
             return
 
         if head == "settings":
@@ -600,6 +610,19 @@ class WebHandler(BaseHTTPRequestHandler):
             self._send_json({"started": True}, status=202)
             return
 
+        if head == "accounts" and len(parts) == 3 and parts[2] == "unliked":
+            account = web.account(parts[1])
+            if account is None:
+                self._send_error(404, "Unknown account")
+                return
+            video_ids = body.get("video_ids") or []
+            if not video_ids:
+                self._send_error(400, "No video ids given")
+                return
+            result = web.app.purge_unliked_records(account, video_ids)
+            self._send_json(result)
+            return
+
         if head == "settings" and len(parts) == 1:
             settings = dict(web.app.load_settings())
             for key in (
@@ -655,6 +678,25 @@ class WebHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
 
+        if head == "duplicates" and len(parts) == 2 and parts[1] == "export":
+            try:
+                accounts = web.app.get_accounts()
+                report = web.app.find_cross_account_duplicates(accounts)
+                candidates = web.app.duplicate_removal_candidates(
+                    accounts,
+                    report,
+                )
+                path = web.app.export_duplicates_report(
+                    {
+                        "report": report,
+                        "candidates": candidates,
+                    }
+                )
+                self._send_json({"file": str(path)})
+            except Exception as error:
+                self._send_error(500, f"Duplicate export failed: {error}")
+            return
+
         if head == "duplicates" and len(parts) == 2 and parts[1] == "remove":
             self._remove_duplicates(body)
             return
@@ -671,10 +713,15 @@ class WebHandler(BaseHTTPRequestHandler):
 
         quality = str(body.get("quality", "best"))
         policy = str(body.get("existing_policy", "skip"))
-        mode = str(body.get("session", "once"))
         output = str(body.get("output", "library"))
         count = int(body.get("count", 0) or 0)
         video_ids = body.get("video_ids") or []
+
+        settings = web.app.load_settings()
+
+        mode = str(body.get("session", ""))
+        if not mode:
+            mode = str(settings.get("default_session", "once"))
 
         quality_values = [
             value for _label, value in web.app.QUALITY_OPTIONS
@@ -689,9 +736,10 @@ class WebHandler(BaseHTTPRequestHandler):
             self._send_error(400, f"Unknown session mode: {mode}")
             return
 
-        settings = web.app.load_settings()
-
-        if output == "most_played":
+        if output == "repair":
+            tracks = web.app.repair_pending_tracks(account, quality)
+            output_dir = None
+        elif output == "most_played":
             ranked, plays = self._most_played_tracks(account, count)
             tracks = [
                 {
