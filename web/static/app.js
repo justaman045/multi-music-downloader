@@ -215,7 +215,7 @@ function modal(title, bodyHTML, actions = []) {
       btn.onclick = () => {
         const action = actions[Number(btn.dataset.a)];
         const value = action.value ? action.value() : true;
-        if (value !== false) close(value);
+        close(value === false ? null : value);
       };
     });
     const auto = actions.find((a) => a.autoFocus);
@@ -537,6 +537,56 @@ async function startDownload(config) {
   return snapshot;
 }
 
+function needsDownload(t) {
+  return t.status !== "downloaded";
+}
+
+function groupByAccount(tracks) {
+  const groups = new Map();
+  for (const t of tracks) {
+    if (!groups.has(t.account)) groups.set(t.account, []);
+    groups.get(t.account).push(t);
+  }
+  return groups;
+}
+
+function accountHasActiveDownload(slug) {
+  const s = state.downloads[slug];
+  return !!(s && !s.finished);
+}
+
+async function startAutoDownload(tracks, { title = "Start download" } = {}) {
+  tracks = tracks.filter(needsDownload);
+  if (!tracks.length) return false;
+  const config = await downloadDialog({ account: "", title });
+  if (!config) return false;
+  let started = 0;
+  let skipped = 0;
+  const accountNames = state.library ? state.library.accounts : [];
+  const nameFor = (slug) => (accountNames.find((a) => a.slug === slug) || {}).name || slug;
+  for (const [slug, group] of groupByAccount(tracks)) {
+    if (accountHasActiveDownload(slug)) {
+      skipped += group.length;
+      toast(`Already downloading for ${nameFor(slug)} — skipped`, "info");
+      continue;
+    }
+    try {
+      await startDownload({
+        account: slug,
+        quality: config.quality,
+        existing_policy: config.existing_policy,
+        session: config.session,
+        video_ids: group.map((t) => t.id),
+      });
+      started += group.length;
+    } catch (e) {
+      toast(`Failed to start ${nameFor(slug)}: ${e.message}`, "error");
+    }
+  }
+  if (started) toast(`Downloading ${started} song${started === 1 ? "" : "s"}…`, "info");
+  return started > 0;
+}
+
 async function downloadDialog({ account, title = "Start download", bodyHTML = "", defaults = null } = {}) {
   if (!defaults) {
     try { defaults = await api("/api/settings"); } catch (e) { defaults = {}; }
@@ -633,12 +683,14 @@ function trackRowsHTML(tracks) {
       <td>
         <span class="q-badge"><span class="state-dot ${esc(t.status)}"></span>${esc(t.quality || "Not downloaded")}</span>
       </td>
+      <td>${needsDownload(t) ? `<button class="btn btn-ghost row-dl" data-id="${esc(t.id)}" data-account="${esc(t.account)}" title="Download to ${esc(t.account_name)}">&#8681;</button>` : ""}</td>
     </tr>`).join("");
 }
 
 function trackTable(tracks, opts = {}) {
   if (!tracks.length) return empty(opts.emptyText || "No songs in this view yet.");
   const showAccount = state.scope === "all";
+  const online = tracks.filter(needsDownload);
   const head = `
     <th data-col="index">#</th>
     <th data-col="title">Title</th>
@@ -652,7 +704,7 @@ function trackTable(tracks, opts = {}) {
   return `
     <div class="filter-bar">
       <input id="track-filter" class="input" type="text" placeholder="Filter by title, artist, album…" />
-      <button id="download-view" class="btn btn-primary">&#8681; Download</button>
+      ${online.length ? `<button id="download-view" class="btn btn-primary">&#8681; Download ${online.length}</button>` : ""}
     </div>
     <div style="overflow-x:auto">
       <table class="tracks">
@@ -672,6 +724,7 @@ function bindTrackTable(container, allTracks) {
     $$("tbody tr", table).forEach((row) => {
       row.onclick = (e) => {
         if (e.target.closest("a")) return;
+        if (e.target.closest("button")) return;
         const index = Number(row.dataset.index);
         setQueue(allTracks, index);
       };
@@ -715,11 +768,33 @@ function bindTrackTable(container, allTracks) {
   const downloadBtn = $("#download-view", container);
   if (downloadBtn) {
     downloadBtn.onclick = async () => {
-      if (state.scope === "all") { toast("Select a single account to download", "info"); return; }
-      const config = await downloadDialog({ account: state.scope, title: "Download liked music" });
-      if (config) { try { await startDownload(config); navigate(); } catch (e) { toast(e.message, "error"); } }
+      await startAutoDownload(allTracks, { title: "Download missing tracks" });
     };
   }
+
+  $$(".row-dl", table).forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const t = allTracks.find((x) => x.id === btn.dataset.id && x.account === btn.dataset.account);
+      if (!t) return;
+      if (accountHasActiveDownload(t.account)) {
+        toast(`Already downloading for ${t.account_name}`, "info");
+        return;
+      }
+      const config = await downloadDialog({ account: t.account, title: `Download “${t.title}”` });
+      if (!config) return;
+      try {
+        await startDownload({
+          account: t.account,
+          quality: config.quality,
+          existing_policy: config.existing_policy,
+          session: config.session,
+          video_ids: [t.id],
+        });
+        toast(`Downloading “${t.title}”…`, "info");
+      } catch (err) { toast(err.message, "error"); }
+    };
+  });
 }
 
 async function renderHome() {
@@ -735,6 +810,7 @@ async function renderHome() {
 
   const recent = [...tracks].filter((t) => t.added).sort((a, b) => b.added - a.added).slice(0, 12);
   const topPlayed = [...tracks].filter((t) => t.plays).sort((a, b) => b.plays - a.plays).slice(0, 8);
+  const online = tracks.filter(needsDownload);
 
   view.innerHTML = `
     <div class="hero">
@@ -743,7 +819,7 @@ async function renderHome() {
       <p>Your downloaded music, organized like a streaming service — search, browse by artist, album, year or genre, and play anything instantly. Everything stays on this machine.</p>
       <div class="hero-actions">
         <button id="hero-refresh" class="btn btn-ghost">&#8635; Refresh library</button>
-        ${state.scope !== "all" ? '<button id="hero-download" class="btn btn-primary">&#8681; Download liked music</button>' : ""}
+        ${online.length ? `<button id="hero-download" class="btn btn-primary">&#8681; Download ${online.length}</button>` : ""}
         <a href="#/most-played" class="btn">&#128172; Most played</a>
       </div>
     </div>
@@ -769,8 +845,7 @@ async function renderHome() {
   if (heroRefresh) heroRefresh.onclick = () => { refreshLibrary(state.scope); };
   const heroDownload = $("#hero-download");
   if (heroDownload) heroDownload.onclick = async () => {
-    const config = await downloadDialog({ account: state.scope, title: "Download liked music" });
-    if (config) { try { await startDownload(config); } catch (e) { toast(e.message, "error"); } }
+    await startAutoDownload(online, { title: "Download missing tracks" });
   };
 
   const grid = (el, list) => {
@@ -866,6 +941,7 @@ async function renderArtist(name) {
   const { artists } = aggregates();
   const exact = artists.find((a) => a.name === name);
 
+  const online = tracks.filter(needsDownload);
   view.innerHTML = `
     <div class="page-hero">
       <div class="big-art" data-name="${esc(name)}">
@@ -877,7 +953,7 @@ async function renderArtist(name) {
         <div class="p-sub">${tracks.length} song${tracks.length === 1 ? "" : "s"} · ${albums.length} album${albums.length === 1 ? "" : "s"} · ${plays} play${plays === 1 ? "" : "s"}</div>
         <div class="hero-actions">
           <button id="artist-play" class="btn btn-primary">&#9654; Play</button>
-          <button id="artist-download" class="btn">&#8681; Download all</button>
+          ${online.length ? `<button id="artist-download" class="btn">&#8681; Download ${online.length}</button>` : ""}
         </div>
       </div>
     </div>
@@ -886,12 +962,7 @@ async function renderArtist(name) {
 
   $("#artist-play").onclick = () => setQueue(tracks.filter((t) => t.stream), 0);
   $("#artist-download").onclick = async () => {
-    if (state.scope === "all") { toast("Select a single account first", "info"); return; }
-    const config = await downloadDialog({ account: state.scope, title: `Download ${name}` });
-    if (config) {
-      config.video_ids = tracks.map((t) => t.id);
-      try { await startDownload(config); } catch (e) { toast(e.message, "error"); }
-    }
+    await startAutoDownload(online, { title: `Download missing ${name} tracks` });
   };
   bindTrackTable(view, tracks);
 }
@@ -900,6 +971,7 @@ async function renderAlbum(key) {
   const [albumTitle, artist] = key.split("###");
   const tracks = tracksForAlbum(key);
   const art = tracks.find((t) => t.art);
+  const online = tracks.filter(needsDownload);
 
   view.innerHTML = `
     <div class="page-hero">
@@ -914,7 +986,7 @@ async function renderAlbum(key) {
         </div>
         <div class="hero-actions">
           <button id="album-play" class="btn btn-primary">&#9654; Play</button>
-          <button id="album-download" class="btn">&#8681; Download album</button>
+          ${online.length ? `<button id="album-download" class="btn">&#8681; Download ${online.length}</button>` : ""}
         </div>
       </div>
     </div>
@@ -922,12 +994,7 @@ async function renderAlbum(key) {
 
   $("#album-play").onclick = () => setQueue(tracks.filter((t) => t.stream), 0);
   $("#album-download").onclick = async () => {
-    if (state.scope === "all") { toast("Select a single account first", "info"); return; }
-    const config = await downloadDialog({ account: state.scope, title: `Download ${albumTitle}` });
-    if (config) {
-      config.video_ids = tracks.map((t) => t.id);
-      try { await startDownload(config); } catch (e) { toast(e.message, "error"); }
-    }
+    await startAutoDownload(online, { title: `Download missing ${albumTitle} tracks` });
   };
   bindTrackTable(view, tracks);
 }

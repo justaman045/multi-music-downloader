@@ -86,3 +86,59 @@ def test_spa_exposes_all_nav_routes():
     assert expected.issubset(registered), (
         f"missing route registrations: {sorted(expected - registered)}"
     )
+
+
+def extract_function(src: str, name: str) -> str:
+    match = re.search(
+        rf"(?:async )?function {name}\((?P<body>.*?)\n\}}",
+        src,
+        re.S,
+    )
+    assert match, f"{name}() not found in app.js"
+    return match.group("body")
+
+
+def test_spa_download_ui_gated_on_needs_download():
+    """Download affordances must only appear for online-only tracks.
+
+    Regression: the view-level Download button and per-row download control
+    must be gated on needsDownload() so fully-local views show no download UI.
+    """
+    src = read_spa()
+
+    table = extract_function(src, "trackTable")
+    assert re.search(r"online\.length \? `<button id=\"download-view\"", table), (
+        "trackTable must only render #download-view when online tracks exist"
+    )
+
+    rows = extract_function(src, "trackRowsHTML")
+    assert re.search(r"needsDownload\(t\) \? `<button class=\"btn btn-ghost row-dl\"", rows), (
+        "trackRowsHTML must render a per-row download control only for "
+        "online-only tracks"
+    )
+
+    assert "const online = tracks.filter(needsDownload)" in table
+
+
+def test_spa_no_manual_account_gate():
+    """Downloading must not require manually selecting an account first.
+
+    Regression: every download handler used to bail out with a toast asking
+    the user to pick a single account. Downloads now target the account each
+    track belongs to automatically.
+    """
+    src = read_spa()
+    assert "Select a single account" not in src, (
+        "manual account-selection gate still present in download handlers"
+    )
+    assert "Select a single account to download" not in src
+
+
+def test_spa_auto_download_helpers():
+    """The grouped auto-download helpers must exist."""
+    src = read_spa()
+    for helper in ("needsDownload", "groupByAccount", "startAutoDownload", "accountHasActiveDownload"):
+        assert re.search(
+            rf"(?:async )?function {helper}\(",
+            src,
+        ), f"{helper}() not defined in app.js"

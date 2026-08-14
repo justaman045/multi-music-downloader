@@ -60,8 +60,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "5.0.1"
-APP_BUILD = "2026-08-14-fix-spa-navigation-fallthrough"
+APP_VERSION = "5.0.2"
+APP_BUILD = "2026-08-14-web-smart-downloads"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
