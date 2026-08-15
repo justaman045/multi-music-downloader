@@ -269,6 +269,26 @@ def _extract_art_data(path: Path) -> bytes | None:
 # Library model
 # ---------------------------------------------------------------------------
 
+def _plays_counts(app: Any, slug: str) -> dict[str, int]:
+    """Local play counts from files/<slug>/.plays.json (empty if none)."""
+    try:
+        import json
+
+        base = Path(app.FILES_DIR) if hasattr(app, "FILES_DIR") else Path("files")
+        path = base / slug / ".plays.json"
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        plays = {}
+        for video_id, entry in (data.get("plays") or {}).items():
+            count = int(entry.get("count", 0))
+            if count > 0:
+                plays[video_id] = count
+        return plays
+    except Exception:
+        return {}
+
+
 def build_library(app: Any) -> dict[str, Any]:
     """Merge every account's inventory into one enriched track list."""
     accounts = app.get_accounts()
@@ -285,10 +305,16 @@ def build_library(app: Any) -> dict[str, Any]:
         records = inventory["tracks"]
 
         plays: dict[str, int] = {}
+
+        # Local listening history is authoritative; the Most Played
+        # report only fills in when no local plays exist yet.
         report = (
             Path(account["output"]) / "Most_Played" / ".most_played.json"
         )
-        if report.exists():
+        local = _plays_counts(app, slug)
+        if local:
+            plays = local
+        elif report.exists():
             try:
                 import json
 
@@ -299,6 +325,7 @@ def build_library(app: Any) -> dict[str, Any]:
                     )
             except Exception:
                 pass
+
         plays_by_account[slug] = plays
         most_played_reports[slug] = report
 
@@ -338,6 +365,7 @@ def build_library(app: Any) -> dict[str, Any]:
                     "account": slug,
                     "account_name": account.get("name", slug),
                     "status": status,
+                    "blocked_reason": (record.get("blocked") or {}).get("reason"),
                     "quality": _track_quality(app, record, has_file),
                     "art": art_url_for(app, account, video_id) if has_file else None,
                     "stream": (
@@ -364,6 +392,22 @@ def build_library(app: Any) -> dict[str, Any]:
     }
 
 
+def _is_premium_blocked(record: dict[str, Any]) -> bool:
+    """True when the track is known to be behind the YouTube Music
+    Premium wall: either a recorded block or a failed attempt whose
+    reason mentions premium (covers records written before blocks
+    existed)."""
+    blocked = record.get("blocked") or {}
+    if blocked.get("reason") == "premium":
+        return True
+    for entry in (record.get("qualities") or {}).values():
+        if entry.get("status") == "failed" and "premium" in (
+            entry.get("reason") or ""
+        ).lower():
+            return True
+    return False
+
+
 def _track_status(record: dict[str, Any], has_file: bool) -> str:
     qualities = record.get("qualities", {})
     downloaded = any(
@@ -373,6 +417,8 @@ def _track_status(record: dict[str, Any], has_file: bool) -> str:
 
     if has_file:
         return "downloaded"
+    if _is_premium_blocked(record):
+        return "premium"
     if downloaded:
         return "missing"
     if qualities:

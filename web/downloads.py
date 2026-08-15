@@ -35,6 +35,7 @@ class DownloadManager:
         sessions: list[Any],
         settings: dict[str, Any],
         output_dir=None,
+        source: str = "library",
     ) -> dict[str, Any]:
         slug = account["slug"]
         session_id = uuid.uuid4().hex[:12]
@@ -68,6 +69,7 @@ class DownloadManager:
             settings,
             callback,
             output_dir=output_dir,
+            source=source,
         )
 
         with self._lock:
