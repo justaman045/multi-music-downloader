@@ -1,9 +1,9 @@
 # YT Music Downloader
 
 A self-contained, multi-account **YouTube Music liked-music downloader** with
-a terminal UI (TUI). Add one or more YouTube Music accounts, refresh your
-liked library, and download every liked track at your chosen quality — all
-in a single terminal app.
+a terminal UI (TUI) and a local Spotify-style web player. Add one or more
+YouTube Music accounts, refresh your liked library, and download every liked
+track at your chosen quality — all without sending your music off-machine.
 
 Everything runs inside a project-local virtualenv (`./venv`): Python
 dependencies, a `yt-dlp` binary, a Deno binary (used by yt-dlp for YouTube
@@ -37,6 +37,19 @@ challenges), and FFmpeg. No system-wide installs are required.
   outcomes with one-click retry of the failed ones.
 - **Persistent JSON reports** for everything.
 - **Self-contained runtime** — project-local yt-dlp, Deno, and FFmpeg.
+- **Premium-lock detection** — tracks behind the YouTube Music Premium wall
+  are classified separately from ordinary failures and reported in status.
+- **Local web player** — a browser UI (served by the app itself) that can
+  stream any downloaded file: browse by artist/album/year/genre, search
+  across all accounts, and trigger refreshes/downloads.
+- **Play tracking + last.fm** — play counts are recorded locally per account
+  and, if you opt in, scrobbled to last.fm in the background.
+- **Playlists** — custom playlists stored app-wide plus a snapshot of each
+  account's YouTube Music playlists.
+- **Scheduler** — optional background jobs for auto library refresh, retrying
+  premium-gated downloads, and periodic backups.
+- **Backups** — one-click zip backups of settings, accounts, and inventory,
+  with on-demand restore and pruning.
 
 ---
 
@@ -103,11 +116,16 @@ anything off-machine. When the server runs with `--token`, the UI prompts
 for the token on first load and remembers it.
 
 API endpoints are prefixed `/api/`: `/api/health`, `/api/accounts`,
-`/api/library`, `/api/most-played/<slug>`, `/api/media/<slug>/<video_id>/stream`,
-`/api/art/<slug>/<video_id>.jpg`, `/api/events` (Server-Sent Events for live
-download/refresh progress), plus POST handlers for refresh, downloads,
-duplicate removal/export, settings, backup, and per-account unliked preview
-and purge.
+`/api/accounts/<slug>/refresh`, `/api/accounts/<slug>/unliked`,
+`/api/library`, `/api/settings`, `/api/downloads`, `/api/most-played/<slug>`,
+`/api/status/<slug>`, `/api/duplicates` (+ `within`, `export`, `remove`),
+`/api/upgrade-preview/<slug>`, `/api/yt-dlp-update`, `/api/auth-health`,
+`/api/backup` + `/api/backups` (+ `prune`), `/api/search?q=`, `/api/stats`,
+`/api/history`, `/api/lastfm` (+ `flush`), `/api/plays`, `/api/tags`,
+`/api/scheduler` (+ run-now), `/api/playlists` (+ add/remove/update/export/
+import/sync), `/api/media/<slug>/<video_id>/stream` (Range-served audio),
+`/api/art/<slug>/<video_id>.jpg`, `/api/verify`, and `/api/events`
+(Server-Sent Events for live download/refresh progress).
 
 ---
 
@@ -150,7 +168,7 @@ temp files first, then are renamed to their final tagged filename.
 
 | Path | Purpose |
 | --- | --- |
-| `ytm-ll-dl-modern.py` | The entire application (~7800 lines, single file). |
+| `ytm-ll-dl-modern.py` | The entire application (~9100 lines, single file). |
 | `install.sh` / `run.sh` | Setup and launcher scripts. |
 | `requirements.txt` | Pinned Python dependencies. |
 | `venv/` | Project-local Python environment + yt-dlp/Deno binaries (created by `install.sh`). |
@@ -160,6 +178,7 @@ temp files first, then are renamed to their final tagged filename.
 | `files/<slug>/.inventory.json` | Authoritative per-track index (download state, quality, results). |
 | `files/<slug>/.status.json` | Snapshot of the last refresh scan. |
 | `files/<slug>/<Quality_Dir>/` | Downloaded music, e.g. `MP3_320kbps`, `FLAC`. |
+| `web/` | The web player package: HTTP server, SPA, downloads/refresh workers, play tracking, playlists, and scheduler. |
 
 The app writes every file atomically (temp file + rename), so an
 interrupted run never leaves a half-written index behind.
@@ -188,7 +207,7 @@ app isn't running.
 ## Roadmap
 
 - Spotify, Amazon Music, and Apple Music support
-- Search-and-download across all connected accounts
+- On-demand track search-and-download from the TUI
 - Your feature requests are welcome
 
 ## Notes
