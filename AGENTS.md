@@ -109,11 +109,12 @@ with pytest, `node --check` for JS, and a manual run.
   and drives HTTP flows (settings roundtrip, media streaming, token gate).
   CI (`.github/workflows/ci.yml`) runs this plus compile, help/version, the
   venv guard, and a secret scan for cookie patterns.
-- **CI secret scan self-match**: the secret scan greps for the literal patterns
-  `SAPISID|SIDCC|__Secure-|PASTE YOUR`, which also appear in the workflow file
-  itself — so the grep always matches `.github/workflows/ci.yml` and the job
-  fails unless that file stays excluded via the `:(exclude).github/workflows/ci.yml`
-  pathspec (ci.yml:61). Don't remove that exclusion.
+- **CI secret scan self-match**: the secret scan greps for the literal cookie
+  header names the app uses for YouTube Music auth, which also appear in the
+  workflow file itself — so the grep always matches `.github/workflows/ci.yml`
+  and the job fails unless that file stays excluded via the
+  `:(exclude).github/workflows/ci.yml` pathspec (ci.yml:61). Don't remove that
+  exclusion, and never write those literal names into docs or code.
 - **SPA test extraction**: `tests/test_spa.py`'s naive `extract_function()` regex
   stops at the first standalone `}`, so it can't parse functions with nested
   blocks (try/catch, e.g. `restorePlayer`). Use `extract_function_balanced()`
