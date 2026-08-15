@@ -46,6 +46,12 @@
 
       <div class="nav-group-label">Playlists &amp; Tools</div>
       <nav id="tools-nav">
+        <a href="#/playlists" data-route="playlists" class="nav-item">
+          <span class="nav-ico"></span>Playlists
+        </a>
+        <a href="#/stats" data-route="stats" class="nav-item">
+          <span class="nav-ico"></span>Stats
+        </a>
         <a href="#/most-played" data-route="most-played" class="nav-item">Most Played</a>
         <a href="#/duplicates" data-route="duplicates" class="nav-item">Duplicates</a>
         <a href="#/status" data-route="status" class="nav-item">Library Status</a>
@@ -101,10 +107,20 @@
         </div>
       </div>
       <div id="player-right">
+        <button id="btn-sleep" class="ctl-btn" title="Sleep timer">&#9200;</button>
         <button id="btn-mute" class="ctl-btn" title="Mute (M)">&#128266;</button>
         <input id="volume" type="range" min="0" max="100" value="80" />
+        <button id="btn-queue" class="ctl-btn" title="Up next (Q)">&#9776;</button>
       </div>
     </footer>
+  </div>
+
+  <div id="queue-drawer" class="queue-drawer hidden">
+    <div class="queue-head">
+      <div class="queue-title">Up next</div>
+      <button id="btn-queue-close" class="icon-btn" title="Close">&times;</button>
+    </div>
+    <div id="queue-list" class="queue-list"></div>
   </div>
 
   <div id="search-overlay" class="overlay hidden">

@@ -464,6 +464,7 @@ table.tracks tbody tr.playing { background: rgba(29,185,84,0.12); }
 .state-dot.missing { background: var(--danger); }
 .state-dot.partial { background: var(--warning); }
 .state-dot.none { background: #4a4a4a; }
+.state-dot.premium { background: #c9a227; }
 
 /* ==========================================================================
    Buttons / inputs
@@ -485,6 +486,7 @@ table.tracks tbody tr.playing { background: rgba(29,185,84,0.12); }
 .btn:hover { background: #333; }
 .btn:active { transform: scale(0.97); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.active { background: var(--accent); color: #000; border-color: var(--accent); }
 
 .btn-primary { background: var(--accent); color: #000; }
 .btn-primary:hover { background: var(--accent-hover); }

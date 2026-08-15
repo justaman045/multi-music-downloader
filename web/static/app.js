@@ -29,6 +29,9 @@ const state = {
   token: localStorage.getItem("ls-token") || "",
   _tokenPrompting: false,
   _renderSeq: 0,
+  settings: null,            // cached /api/settings
+  sleepTimer: { endAt: null, interval: null, endOfSong: false },
+  _playReported: false,      // one play report per track playback
 };
 
 const QUALITIES = [
@@ -178,6 +181,20 @@ function toast(message, type = "") {
     node.style.transform = "translateX(20px)";
     setTimeout(() => node.remove(), 250);
   }, 3800);
+}
+
+function notify(title, body) {
+  if (!state.settings?.notifications_enabled) return;
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "granted") {
+    try { new Notification(title, { body, silent: true }); } catch (e) {}
+  } else if (Notification.permission !== "denied") {
+    Notification.requestPermission().then((p) => {
+      if (p === "granted") {
+        try { new Notification(title, { body, silent: true }); } catch (e) {}
+      }
+    });
+  }
 }
 
 function modal(title, bodyHTML, actions = []) {
@@ -360,6 +377,58 @@ function queueFor(tracks) {
   return queue;
 }
 
+function persistPlayer() {
+  localStorage.setItem("ls-player", JSON.stringify({
+    queue: state.player.queue.map((t) => ({ id: t.id, account: t.account })),
+    index: state.player.index,
+    shuffle: state.player.shuffle,
+    repeat: state.player.repeat,
+    ts: Date.now(),
+  }));
+}
+
+function restorePlayer() {
+  const raw = localStorage.getItem("ls-player");
+  if (!raw) return;
+  let snap;
+  try {
+    snap = JSON.parse(raw);
+  } catch (e) {
+    localStorage.removeItem("ls-player");
+    return;
+  }
+  if (!snap || !Array.isArray(snap.queue) || !snap.queue.length) {
+    localStorage.removeItem("ls-player");
+    return;
+  }
+  if (!state.library || !Array.isArray(state.library.tracks)) return;
+  const byKey = new Map(state.library.tracks.map((t) => [t.id + "###" + t.account, t]));
+  const queue = [];
+  for (const ref of snap.queue) {
+    if (!ref || typeof ref.id !== "string") continue;
+    const t = byKey.get(ref.id + "###" + ref.account);
+    if (t && t.stream) queue.push(t);
+  }
+  if (!queue.length) {
+    localStorage.removeItem("ls-player");
+    return;
+  }
+  let index = Number.isInteger(snap.index) ? snap.index : 0;
+  if (index < 0) index = 0;
+  if (index >= queue.length) index = queue.length - 1;
+  state.player.queue = queue;
+  state.player.index = index;
+  state.player.shuffle = !!snap.shuffle;
+  if (snap.repeat === "off" || snap.repeat === "all" || snap.repeat === "one") {
+    state.player.repeat = snap.repeat;
+  }
+  state.player._playReported = false;
+  const track = queue[index];
+  audio.src = streamUrl(track);
+  audio.volume = state.player.muted ? 0 : state.player.volume;
+  updatePlayerUI();
+}
+
 function setQueue(tracks, startIndex = 0) {
   state.player.queue = queueFor(tracks);
   state.player.index = -1;
@@ -380,10 +449,12 @@ function playIndex(index) {
   const track = state.player.queue[index];
   const isSame = !!(prev && track && prev.id === track.id && prev.account === track.account);
   state.player.index = index;
+  state._playReported = false;
   if (isSame) {
     audio.currentTime = 0;
     audio.play().then(() => { state.player.playing = true; }).catch(() => {});
     updatePlayerUI();
+    persistPlayer();
     return;
   }
   audio.src = streamUrl(track);
@@ -392,6 +463,7 @@ function playIndex(index) {
     .then(() => { state.player.playing = true; })
     .catch(() => { state.player.playing = false; });
   updatePlayerUI();
+  persistPlayer();
 }
 
 function stopPlayback(message) {
@@ -401,6 +473,7 @@ function stopPlayback(message) {
   state.player.queue = [];
   state.player.index = -1;
   state.player.playing = false;
+  localStorage.removeItem("ls-player");
   if (message) toast(message, "info");
   updatePlayerUI();
 }
@@ -454,7 +527,16 @@ function prev() {
 }
 
 audio.addEventListener("ended", () => {
+  if (state.sleepTimer.endOfSong) {
+    state.sleepTimer.endOfSong = false;
+    state.player.playing = false;
+    updatePlayerUI();
+    toast("Sleep timer ended — playback stopped", "info");
+    notify("Sleep timer", "Playback stopped.");
+    return;
+  }
   if (state.player.repeat === "one") {
+    state._playReported = false;
     audio.currentTime = 0;
     audio.play();
     return;
@@ -475,7 +557,26 @@ audio.addEventListener("timeupdate", () => {
   if ($("#seek").dataset.seeking !== "1") $("#seek").value = String(Math.round(frac));
   $("#cur-time").textContent = fmtTime(audio.currentTime);
   $("#dur-time").textContent = fmtTime(audio.duration);
+  if (audio.currentTime / audio.duration >= 0.6) reportPlay();
 });
+
+async function reportPlay() {
+  if (state._playReported) return;
+  const track = currentTrack();
+  if (!track || !track.id || !track.account) return;
+  state._playReported = true;
+  try {
+    const res = await api("/api/plays", {
+      method: "POST",
+      body: { slug: track.account, video_id: track.id, progress: 60 },
+    });
+    if (res && typeof res.total === "number" && state.library) {
+      const hit = state.library.tracks.find((t) => t.id === track.id && t.account === track.account);
+      if (hit) hit.plays = res.total;
+      if (["home", "stats"].includes(state.route)) navigate();
+    }
+  } catch (e) { /* non-fatal */ }
+}
 
 audio.addEventListener("play", () => { state.player.playing = true; updatePlayerUI(); });
 audio.addEventListener("pause", () => { state.player.playing = false; updatePlayerUI(); });
@@ -508,6 +609,7 @@ function updatePlayerUI() {
   $("#btn-mute").classList.toggle("active", state.player.muted);
   $("#volume").value = String(Math.round(state.player.volume * 100));
   markPlayingRows(track);
+  if (!$("#queue-drawer").classList.contains("hidden")) renderQueueDrawer();
 }
 
 function markPlayingRows(track) {
@@ -515,6 +617,108 @@ function markPlayingRows(track) {
   $$("table.tracks tbody tr").forEach((row) => {
     row.classList.toggle("playing", inScope && !!track && row.dataset.id === track.id && row.dataset.account === track.account);
   });
+}
+
+/* -------------------------------------------------------------------------
+ * Sleep timer
+ * ---------------------------------------------------------------------- */
+
+function clearSleepTimer() {
+  if (state.sleepTimer.interval) clearInterval(state.sleepTimer.interval);
+  state.sleepTimer.interval = null;
+  state.sleepTimer.endAt = null;
+  state.sleepTimer.endOfSong = false;
+  const btn = $("#btn-sleep");
+  if (btn) { btn.classList.remove("active"); btn.title = "Sleep timer"; }
+}
+
+function setSleepTimer(minutes) {
+  clearSleepTimer();
+  if (!minutes) return;
+  state.sleepTimer.endAt = Date.now() + minutes * 60000;
+  state.sleepTimer.interval = setInterval(() => {
+    const remaining = Math.max(0, state.sleepTimer.endAt - Date.now());
+    const btn = $("#btn-sleep");
+    if (btn) {
+      btn.classList.add("active");
+      btn.title = `Sleep in ${Math.ceil(remaining / 60000)}m — click to adjust`;
+    }
+    if (remaining <= 0) {
+      clearSleepTimer();
+      audio.pause();
+      state.player.playing = false;
+      updatePlayerUI();
+      toast("Sleep timer ended — playback stopped", "info");
+      notify("Sleep timer", "Playback stopped.");
+    }
+  }, 10000);
+  toast(`Sleep timer set for ${minutes} minute${minutes === 1 ? "" : "s"}`, "info");
+}
+
+function sleepTimerDialog() {
+  const minutes = Math.round((state.sleepTimer.endAt ? state.sleepTimer.endAt - Date.now() : 0) / 60000);
+  modal(
+    "Sleep timer",
+    `<p style="color:var(--text-dim)">Pause playback automatically after the chosen time. Music stops at the current track boundary (best effort).</p>
+     <div class="filter-bar" style="margin-top:14px">${[15, 30, 45, 60, 90].map((m) => `
+       <button class="btn ${minutes === m ? "btn-primary" : ""}" data-min="${m}" style="flex:1">${m}m</button>`).join("")}
+     </div>`,
+    [
+      { label: "Off", value: () => false },
+      { label: "1 hour", value: () => ({ minutes: 60 }) },
+      { label: "End of song", value: () => ({ minutes: null, endOfSong: true }) },
+    ],
+  ).then((value) => {
+    if (!value) { clearSleepTimer(); return; }
+    if (value.endOfSong) {
+      state.sleepTimer.endOfSong = true;
+      toast("End of song — playback stops when the current track finishes", "info");
+      return;
+    }
+    setSleepTimer(value.minutes);
+  });
+
+  $$("#modal-root [data-min]").forEach((btn) => {
+    btn.onclick = () => {
+      setSleepTimer(Number(btn.dataset.min));
+      const root = $("#modal-root");
+      root.classList.add("hidden");
+      root.innerHTML = "";
+    };
+  });
+}
+
+/* -------------------------------------------------------------------------
+ * Queue drawer
+ * ---------------------------------------------------------------------- */
+
+function toggleQueueDrawer() {
+  const drawer = $("#queue-drawer");
+  drawer.classList.toggle("hidden");
+  if (!drawer.classList.contains("hidden")) renderQueueDrawer();
+}
+
+function renderQueueDrawer() {
+  const list = $("#queue-list");
+  if (!list) return;
+  const q = state.player.queue;
+  const cur = state.player.index;
+  const items = q.map((t, i) => `
+    <div class="queue-item ${i === cur ? "current" : ""}" data-i="${i}">
+      <span class="queue-pos">${i + 1}</span>
+      <div class="mini-art" data-name="${esc(t.artist)}">
+        ${t.art ? `<img src="${esc(t.art)}" loading="lazy" onerror="this.outerHTML=artPlaceholderFor(this)"/>` : artPlaceholder(t.artist)}
+      </div>
+      <div class="queue-meta">
+        <div class="t-title">${esc(t.title)}</div>
+        <div class="t-sub">${esc(t.artist)}</div>
+      </div>
+    </div>`).join("") || `<div class="empty-state" style="padding:24px">Queue is empty.</div>`;
+  list.innerHTML = items;
+  $$(".queue-item", list).forEach((row) => {
+    row.onclick = () => { playIndex(Number(row.dataset.i)); renderQueueDrawer(); };
+  });
+  $("#queue-list").scrollTop = 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -531,6 +735,8 @@ async function startDownload(config) {
   if (config.output) body.output = config.output;
   if (config.count) body.count = config.count;
   if (config.video_ids) body.video_ids = config.video_ids;
+  if (config.playlist_id) body.playlist_id = config.playlist_id;
+  if (config.tracks) body.tracks = config.tracks;
   const snapshot = await api("/api/downloads", { method: "POST", body });
   state.downloads[config.account] = snapshot;
   renderDownloadsBadge();
@@ -538,7 +744,7 @@ async function startDownload(config) {
 }
 
 function needsDownload(t) {
-  return t.status !== "downloaded";
+  return t.status !== "downloaded" && t.status !== "premium";
 }
 
 function groupByAccount(tracks) {
@@ -681,9 +887,10 @@ function trackRowsHTML(tracks) {
       <td style="color:var(--text-dim)">${fmtDuration(t.duration)}</td>
       <td style="color:var(--text-dim)">${t.plays ? t.plays : "—"}</td>
       <td>
-        <span class="q-badge"><span class="state-dot ${esc(t.status)}"></span>${esc(t.quality || "Not downloaded")}</span>
+        <span class="q-badge"><span class="state-dot ${esc(t.status)}"></span>${esc(t.status === "premium" ? "Premium" : (t.quality || "Not downloaded"))}</span>
       </td>
       <td>${needsDownload(t) ? `<button class="btn btn-ghost row-dl" data-id="${esc(t.id)}" data-account="${esc(t.account)}" title="Download to ${esc(t.account_name)}">&#8681;</button>` : ""}</td>
+      <td><button class="btn btn-ghost row-pl" data-id="${esc(t.id)}" data-account="${esc(t.account)}" data-title="${esc(t.title)}" data-artist="${esc(t.artist)}" title="Add to playlist">&#43;</button></td>
     </tr>`).join("");
 }
 
@@ -699,7 +906,9 @@ function trackTable(tracks, opts = {}) {
     <th data-col="year">Year</th>
     <th data-col="duration">Duration</th>
     <th data-col="plays">Plays</th>
-    <th data-col="quality">Quality</th>`;
+    <th data-col="quality">Quality</th>
+    <th></th>
+    <th></th>`;
 
   return `
     <div class="filter-bar">
@@ -772,7 +981,7 @@ function bindTrackTable(container, allTracks) {
     };
   }
 
-  $$(".row-dl", table).forEach((btn) => {
+  if (table) $$(".row-dl", table).forEach((btn) => {
     btn.onclick = async (e) => {
       e.stopPropagation();
       const t = allTracks.find((x) => x.id === btn.dataset.id && x.account === btn.dataset.account);
@@ -795,6 +1004,57 @@ function bindTrackTable(container, allTracks) {
       } catch (err) { toast(err.message, "error"); }
     };
   });
+
+  if (table) $$(".row-pl", table).forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const t = allTracks.find((x) => x.id === btn.dataset.id && x.account === btn.dataset.account);
+      if (!t) return;
+      addToPlaylistModal(t);
+    };
+  });
+}
+
+async function addToPlaylistModal(track) {
+  let playlistsData;
+  try { playlistsData = await api("/api/playlists"); }
+  catch (e) { toast(e.message, "error"); return; }
+  const custom = playlistsData.custom || [];
+  const tname = `${track.title} — ${track.artist}`;
+  const created = await modal(`Add “${tname}” to playlist`, `
+    <div class="label">New playlist name (optional)</div>
+    <input id="pl-new" class="input" type="text" placeholder="Leave empty to pick an existing playlist" />
+    ${custom.length ? `<div class="label" style="margin-top:12px">Existing playlists</div>
+      <select id="pl-pick" class="input">
+        <option value="">— choose —</option>
+        ${custom.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("")}
+      </select>` : ""}`,
+    [
+      { label: "Cancel", value: () => false },
+      {
+        label: "Add",
+        variant: "btn-primary",
+        value: () => {
+          const name = $("#pl-new").value.trim();
+          const id = $("#pl-pick") ? $("#pl-pick").value : "";
+          return { name, id };
+        },
+      },
+    ]);
+  if (!created) return;
+  let playlistId = created.id;
+  try {
+    if (created.name) {
+      const pl = await api("/api/playlists", { method: "POST", body: { name: created.name, kind: "custom", account: track.account } });
+      playlistId = pl.id;
+    }
+    if (!playlistId) { toast("No playlist chosen", "info"); return; }
+    const r = await api(`/api/playlists/${playlistId}/add`, {
+      method: "POST",
+      body: { tracks: [{ video_id: track.id, account: track.account }] },
+    });
+    toast(`Added to playlist (${r.added ?? 0} added)`, r.added ? "success" : "info");
+  } catch (e) { toast(e.message, "error"); }
 }
 
 async function renderHome() {
@@ -1164,6 +1424,10 @@ async function renderDuplicates() {
 
     html += `<div class="empty-state" id="dup-none" style="display:none"><div class="big">&#10004;</div>No duplicates selected.</div>`;
 
+    html += `<div class="section-head" style="margin-top:26px"><h3>Duplicates within a single account</h3></div>
+      <div class="alert alert-info">Re-releases, covers and remasters that share a normalized title + artist inside the same account. Pick which copy to keep — the rest are unliked and their files deleted.</div>
+      <div id="within-root">Loading…</div>`;
+
     view.innerHTML = html;
 
     const update = () => {
@@ -1171,6 +1435,8 @@ async function renderDuplicates() {
       $("#dup-remove").disabled = checked.length === 0;
     };
     $$(".dup-cb").forEach((cb) => { cb.onchange = update; });
+
+    populateWithinDuplicates(seq);
 
     $("#dup-remove").onclick = async () => {
       const checked = $$(".dup-cb:checked");
@@ -1212,6 +1478,57 @@ async function renderDuplicates() {
   }
 }
 
+async function populateWithinDuplicates(seq) {
+  const root = $("#within-root");
+  if (!root) return;
+  let data;
+  try { data = await api("/api/duplicates/within"); } catch (e) { root.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`; return; }
+  if (seq !== state._renderSeq) return;
+
+  let html = "";
+  for (const acc of data) {
+    if (acc.error) { html += `<div class="alert alert-error">${esc(acc.name || acc.slug)}: ${esc(acc.error)}</div>`; continue; }
+    const groups = acc.groups || [];
+    html += `<div class="dup-section">
+      <div class="dup-title">${esc(acc.name)} (${groups.length} group${groups.length === 1 ? "" : "s"})</div>
+      ${groups.length ? groups.map((g) => `
+        <div class="dup-title" style="padding:10px 0 4px;color:var(--text-dim)">${esc(g.title)} — ${esc(g.artist)}</div>
+        ${g.tracks.map((t) => `
+          <div class="check-row">
+            <label>
+              <input type="checkbox" class="within-cb" data-slug="${esc(acc.slug)}" data-vid="${esc(t.video_id)}" data-label="${esc(`${t.title} — ${t.artist}${t.album ? " [" + t.album + "]" : ""} [${(t.qualities || []).join(", ")}]`)}" />
+              <span>${esc(t.title)} <span style="color:var(--text-faint)">${t.album ? esc("[" + t.album + "]") : ""} · ${(t.qualities || []).join(", ")}</span></span>
+            </label>
+          </div>`).join("")}
+        ${g.tracks.length > 1 ? `<button class="btn btn-ghost" style="margin:6px 0 10px;padding:5px 12px;font-size:12px" data-within-keep="${esc(acc.slug)}" data-keep-vid="${esc(g.tracks[0].video_id)}" data-keep-label="${esc(g.tracks[0].title)}">Keep first copy</button>` : ""}
+      `).join("") : `<div class="empty-state" style="padding:12px">No within-account duplicates.</div>`}
+    </div>`;
+  }
+
+  root.innerHTML = html;
+
+  $$("[data-within-keep]", root).forEach((btn) => {
+    btn.onclick = async () => {
+      const group = data.find((a) => a.slug === btn.dataset.withinKeep);
+      const keep = btn.dataset.keepVid;
+      const entry = group?.groups?.flatMap((g) => g.tracks).find((t) => t.video_id === keep);
+      const label = `${btn.dataset.keepLabel}${entry?.album ? " [" + entry.album + "]" : ""}`.trim();
+      const others = group?.groups?.flatMap((g) => g.tracks).filter((t) => t.video_id !== keep) || [];
+      const ok = await confirmModal("Remove duplicate copies", `Keep “${label}” and remove ${others.length} other copy/copies (unlike + delete files)?`);
+      if (!ok) return;
+      try {
+        const r = await api("/api/duplicates/within/remove", {
+          method: "POST",
+          body: { slug: btn.dataset.withinKeep, video_ids: others.map((t) => t.video_id) },
+        });
+        toast(`Removed ${r.removed.length} duplicate${r.removed.length === 1 ? "" : "s"}`, "success");
+        loadLibrary();
+        renderDuplicates();
+      } catch (e) { toast(e.message, "error"); }
+    };
+  });
+}
+
 async function renderStatus() {
   const seq = state._renderSeq;
   view.innerHTML = spinner();
@@ -1231,7 +1548,7 @@ async function renderStatus() {
       <div class="panel">
         <h3>${esc(slug)} <span style="color:var(--text-faint);font-weight:600;font-size:12px">${status.quality || ""} · ${status.timestamp ? new Date(status.timestamp * 1000).toLocaleString() : "no snapshot yet"}</span></h3>
         <div class="stat-grid" style="margin:6px 0 0">
-          ${[["liked", "Liked"], ["downloaded", "Downloaded"], ["not_downloaded", "Not downloaded"], ["missing", "Missing files"], ["no_longer_liked", "No longer liked"], ["failed", "Failed"], ["skipped", "Skipped"]].map(([k, label]) => `
+          ${[["liked", "Liked"], ["downloaded", "Downloaded"], ["not_downloaded", "Not downloaded"], ["missing", "Missing files"], ["no_longer_liked", "No longer liked"], ["failed", "Failed"], ["skipped", "Skipped"], ["premium", "Premium-locked"]].map(([k, label]) => `
             <div class="stat-card" style="padding:14px 16px">
               <div class="stat-value" style="font-size:20px">${counts[k] ?? 0}</div>
               <div class="stat-label">${label}</div>
@@ -1239,13 +1556,17 @@ async function renderStatus() {
         </div>
         <div class="filter-bar" style="margin-top:12px">
           <button class="btn btn-ghost" data-act="repair" data-slug="${esc(slug)}">&#10003; Repair downloads</button>
+          <button class="btn btn-ghost" data-act="upgrade" data-slug="${esc(slug)}">&#9650; Upgrade quality</button>
+          <button class="btn btn-ghost" data-act="premium" data-slug="${esc(slug)}">&#128176; Retry premium</button>
           <button class="btn btn-ghost" data-act="purge" data-slug="${esc(slug)}">&#128465; Purge no-longer-liked</button>
+          <button class="btn btn-ghost" data-act="verify" data-slug="${esc(slug)}">&#128221; Verify files</button>
         </div>
       </div>`;
 
     for (const [key, label, icon] of [
       ["missing", "MISSING FILES", "&#9888;"],
       ["not_downloaded", "NOT DOWNLOADED", "&#128718;"],
+      ["premium", "PREMIUM-LOCKED", "&#128176;"],
       ["no_longer_liked", "NO LONGER LIKED", "&#9824;"],
       ["failed", "FAILED", "&#10007;"],
       ["skipped", "SKIPPED", "&#8618;"],
@@ -1269,9 +1590,94 @@ async function renderStatus() {
   $$("[data-act]", view).forEach((btn) => {
     btn.onclick = () => {
       if (btn.dataset.act === "repair") repairDialog(btn.dataset.slug);
+      else if (btn.dataset.act === "upgrade") upgradeDialog(btn.dataset.slug);
+      else if (btn.dataset.act === "premium") premiumRetryDialog(btn.dataset.slug);
+      else if (btn.dataset.act === "verify") verifyDialog(btn.dataset.slug);
       else purgeDialog(btn.dataset.slug);
     };
   });
+}
+
+async function verifyDialog(slug) {
+  const ok = await confirmModal("Verify files", `Hash every downloaded file in <strong>${esc(slug)}</strong> and flag any that are missing or corrupted?`);
+  if (!ok) return;
+  try {
+    const report = await api("/api/verify", { method: "POST", body: { slug } });
+    const s = report.summary || {};
+    const bad = (s.missing || 0) + (s.corrupt || 0) + (s.size_zero || 0);
+    const acc = (state.library?.accounts || []).find((a) => a.slug === slug);
+    const heading = `Verification — ${esc(acc?.name || slug)}`;
+    if (!bad) {
+      toast(`All ${report.total} files OK`, "success");
+      return;
+    }
+    const problems = Object.values(report.results || {}).filter((r) => r.status !== "ok");
+    const rows = problems.map((r) => `
+      <tr>
+        <td style="color:var(--text-faint)">${esc(r.status)}</td>
+        <td><div class="track-cell"><div class="t-main"><div class="t-title">${esc(r.title)}</div><div class="t-sub">${esc(r.artist)}</div></div></div></td>
+        <td style="color:var(--text-dim)">${esc(r.quality)}</td>
+        <td style="color:var(--text-faint);font-size:12px">${esc(r.reason || "")}</td>
+      </tr>`).join("");
+    const action = await modal(heading, `
+      <p><strong>${bad}</strong> problem file${bad === 1 ? "" : "s"} found (${s.missing || 0} missing, ${s.corrupt || 0} corrupt, ${s.size_zero || 0} empty).</p>
+      <table class="tracks"><thead><tr><th>Status</th><th>Title</th><th>Quality</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table>`,
+      [
+        { label: "Close", value: () => true },
+        { label: "Repair", variant: "btn-primary", value: () => "repair" },
+      ]);
+    if (action === "repair") repairDialog(slug);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function upgradeDialog(slug) {
+  const config = await modal("Upgrade quality", `
+    <p>Re-download every track in <strong>${esc(slug)}</strong> that currently has a file at a lower quality. Existing higher-quality files are left alone.</p>
+    <div class="label">Target quality</div>
+    <select name="quality" class="input">
+      ${QUALITIES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join("")}
+    </select>`,
+    [
+      { label: "Cancel", value: () => false },
+      {
+        label: "Preview",
+        variant: "btn-primary",
+        value: () => ({ quality: $("#modal-root select[name=quality]").value }),
+      },
+    ]);
+  if (!config) return;
+
+  const acc = (state.library?.accounts || []).find((a) => a.slug === slug);
+  let preview;
+  try { preview = await api(`/api/upgrade-preview/${slug}?quality=${encodeURIComponent(config.quality)}`); }
+  catch (e) { toast(e.message, "error"); return; }
+  const n = preview.count ?? 0;
+  if (!n) { toast(`Nothing to upgrade for ${acc?.name || slug}`, "info"); return; }
+
+  const ok = await modal("Upgrade preview", `
+    <p><strong>${n}</strong> track${n === 1 ? "" : "s"} in <strong>${esc(acc?.name || slug)}</strong> can be upgraded to ${esc(config.quality)}. Their current files will be replaced.</p>`,
+    [
+      { label: "Cancel", value: () => false },
+      { label: "Upgrade all", variant: "btn-primary", value: () => true },
+    ]);
+  if (!ok) return;
+  try {
+    await startDownload({ account: slug, quality: config.quality, existing_policy: "replace", session: "once", output: "upgrade" });
+    toast(`Upgrading ${n} track${n === 1 ? "" : "s"}…`, "info");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function premiumRetryDialog(slug) {
+  const ok = await confirmModal("Retry premium-locked tracks", `Retry premium-locked tracks for ${slug} now?`);
+  if (!ok) return;
+  try {
+    const r = await api("/api/scheduler/premium_retry", { method: "POST" });
+    const result = (r.results || {})[slug];
+    const started = result?.started;
+    if (started) toast(`Premium retry started (${result.count} tracks)`, "info");
+    else if (result?.error) toast(`Premium retry: ${result.error}`, "error");
+    else toast("No premium-locked tracks to retry", "info");
+  } catch (e) { toast(e.message, "error"); }
 }
 
 async function repairDialog(slug) {
@@ -1517,12 +1923,53 @@ async function renderSettings() {
         <div style="flex:1"><div class="label">Retry attempts</div><input id="set-attempts" class="input" type="number" min="1" max="20" value="${settings.retry_attempts ?? 3}" /></div>
         <div style="flex:1"><div class="label">Retry delay (s)</div><input id="set-delay" class="input" type="number" min="0" max="300" value="${settings.retry_delay ?? 3}" /></div>
       </div>
+      <div class="label" style="margin-top:14px">Automation</div>
+      <div class="filter-bar">
+        <div style="flex:1"><div class="label">Auto-refresh library (hours, 0 = off)</div><input id="set-auto-refresh" class="input" type="number" min="0" max="168" value="${settings.auto_refresh_interval_hours ?? 0}" /></div>
+        <div style="flex:1"><div class="label">Retry premium-locked (days, 0 = off)</div><input id="set-premium-interval" class="input" type="number" min="0" max="90" value="${settings.premium_retry_interval_days ?? 7}" /></div>
+        <div style="flex:1"><div class="label">Auto-backup (hours, 0 = off)</div><input id="set-backup-interval" class="input" type="number" min="0" max="336" value="${settings.backup_interval_hours ?? 0}" /></div>
+      </div>
+      <div class="filter-bar">
+        <div style="flex:1"><div class="label">Parallel downloads (1-8)</div><input id="set-parallel" class="input" type="number" min="1" max="8" value="${settings.max_parallel_downloads ?? 1}" /></div>
+        <div style="flex:1"><div class="label">Download rate limit (e.g. 500K, 1M, empty = unlimited)</div><input id="set-rate-limit" class="input" type="text" value="${esc(settings.download_rate_limit || "")}" placeholder="Unlimited" autocomplete="off" /></div>
+        <div style="flex:1;display:flex;align-items:flex-end;padding-bottom:6px">
+          <label class="check-label"><input id="set-auto-dl" type="checkbox" ${settings.auto_download_new_likes ? "checked" : ""} /> Auto-download new likes after refresh</label>
+        </div>
+        <div style="flex:1;display:flex;align-items:flex-end;padding-bottom:6px">
+          <label class="check-label"><input id="set-notif" type="checkbox" ${settings.notifications_enabled ? "checked" : ""} /> Desktop notifications</label>
+        </div>
+      </div>
+      <div class="label" style="margin-top:14px">last.fm scrobbling</div>
+      <div class="filter-bar">
+        <div style="flex:1"><div class="label">API key</div><input id="set-lfm-key" class="input" type="text" value="${esc(settings.lastfm_api_key || "")}" autocomplete="off" /></div>
+        <div style="flex:1"><div class="label">API secret</div><input id="set-lfm-secret" class="input" type="password" value="${esc(settings.lastfm_api_secret || "")}" autocomplete="off" /></div>
+      </div>
+      <div class="filter-bar">
+        <div style="flex:1"><div class="label">Username</div><input id="set-lfm-user" class="input" type="text" value="${esc(settings.lastfm_username || "")}" autocomplete="off" /></div>
+        <div style="flex:1"><div class="label">Password (MD5)</div><input id="set-lfm-pass" class="input" type="password" value="${esc(settings.lastfm_password_md5 || "")}" autocomplete="off" /></div>
+        <div style="flex:1;display:flex;align-items:flex-end;padding-bottom:6px">
+          <label class="check-label"><input id="set-lfm-enabled" type="checkbox" ${settings.lastfm_enabled ? "checked" : ""} /> Enable scrobbling</label>
+        </div>
+      </div>
       <div class="label">API token</div>
       <div class="label">Token (only if the server was started with --token)</div>
       <div class="filter-bar">
         <input id="set-token" class="input" type="password" placeholder="Bearer token" value="${esc(state.token)}" autocomplete="off" />
         <button id="set-token-save" class="btn">Save token</button>
         <button id="set-token-clear" class="btn btn-ghost">Clear</button>
+      </div>
+      <div class="label">Maintenance</div>
+      <div class="filter-bar">
+        <button id="set-ytdlp-check" class="btn btn-ghost">&#8635; Check yt-dlp update</button>
+        <button id="set-scrobble" class="btn btn-ghost">&#128228; Flush last.fm scrobbles</button>
+        <button id="set-premium-now" class="btn btn-ghost">&#128176; Retry premium now</button>
+        <button id="set-backup-now" class="btn btn-ghost">&#128190; Backup now</button>
+      </div>
+      <div class="label">Recent backups</div>
+      <div id="backup-list" class="check-row" style="justify-content:space-between"><span style="color:var(--text-faint)">Loading…</span></div>
+      <div class="filter-bar" style="margin-top:6px">
+        <div style="flex:1"><div class="label">Keep newest N backups</div><input id="set-keep-backups" class="input" type="number" min="1" max="200" value="20" /></div>
+        <div style="flex:1;display:flex;align-items:flex-end;padding-bottom:6px"><button id="set-prune-backups" class="btn btn-ghost">&#128465; Prune old backups</button></div>
       </div>
       <div class="modal-actions" style="margin-top:18px">
         <button id="set-save" class="btn btn-primary">Save settings</button>
@@ -1572,25 +2019,538 @@ async function renderSettings() {
       default_limit: Number($("#set-limit").value),
       retry_attempts: Number($("#set-attempts").value),
       retry_delay: Number($("#set-delay").value),
+      auto_refresh_interval_hours: Number($("#set-auto-refresh").value),
+      premium_retry_interval_days: Number($("#set-premium-interval").value),
+      backup_interval_hours: Number($("#set-backup-interval").value),
+      max_parallel_downloads: Number($("#set-parallel").value),
+      download_rate_limit: $("#set-rate-limit").value.trim(),
+      auto_download_new_likes: $("#set-auto-dl").checked,
+      notifications_enabled: $("#set-notif").checked,
+      lastfm_enabled: $("#set-lfm-enabled").checked,
+      lastfm_api_key: $("#set-lfm-key").value.trim(),
+      lastfm_api_secret: $("#set-lfm-secret").value.trim(),
+      lastfm_username: $("#set-lfm-user").value.trim(),
+      lastfm_password_md5: $("#set-lfm-pass").value.trim(),
     };
     try {
-      await api("/api/settings", { method: "POST", body });
+      state.settings = await api("/api/settings", { method: "POST", body });
       toast("Settings saved", "success");
     } catch (e) { toast(e.message, "error"); }
   };
+
+  $("#set-notif").onchange = () => {
+    if ($("#set-notif").checked && "Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  };
+
+  $("#set-ytdlp-check").onclick = async () => {
+    try {
+      const r = await api("/api/yt-dlp-update");
+      if (r.error) { toast(`yt-dlp check failed: ${r.error}`, "error"); return; }
+      if (r.update_available) toast(`yt-dlp ${r.current} → ${r.latest} available`, "info");
+      else toast(`yt-dlp is up to date (${r.current || "?"})`, "success");
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  $("#set-scrobble").onclick = async () => {
+    try {
+      const r = await api("/api/lastfm/flush", { method: "POST", body: {} });
+      if (r.error) toast(`last.fm flush failed: ${r.error}`, "error");
+      else toast(`Scrobbled ${r.sent} track${r.sent === 1 ? "" : "s"}, ${r.failed} failed`, r.sent ? "success" : "info");
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  $("#set-premium-now").onclick = async () => {
+    try {
+      const r = await api("/api/scheduler/premium_retry", { method: "POST" });
+      const started = Object.values(r.results || {}).filter((v) => v?.started).length;
+      toast(started ? `Premium retry started for ${started} account${started === 1 ? "" : "s"}` : "No premium-locked tracks to retry", started ? "info" : "success");
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  $("#set-backup-now").onclick = async () => {
+    try {
+      const r = await api("/api/backup", { method: "POST", body: {} });
+      toast(`Backup written to ${r.file}`, "success");
+      renderBackups();
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  $("#set-prune-backups").onclick = async () => {
+    const keep = Number($("#set-keep-backups").value) || 20;
+    try {
+      const r = await api("/api/backups/prune", { method: "POST", body: { keep } });
+      toast(`Pruned ${r.pruned} old backup${r.pruned === 1 ? "" : "s"}`, "info");
+      renderBackups();
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  renderBackups();
 
   $("#set-backup").onclick = async () => {
     try {
       const r = await api("/api/backup", { method: "POST", body: {} });
       toast(`Backup written to ${r.file}`, "info");
+      renderBackups();
     } catch (e) { toast(e.message, "error"); }
   };
+}
+
+async function renderBackups() {
+  const box = $("#backup-list");
+  if (!box) return;
+  try {
+    const files = await api("/api/backups");
+    box.innerHTML = files.length
+      ? files.slice(0, 8).map((f) => `<span>${esc(f.name)} <span style="color:var(--text-faint)">· ${fmtSize(f.size_bytes)} · ${new Date(f.created_at * 1000).toLocaleString()}</span></span>`).join("")
+      : `<span style="color:var(--text-faint)">No backups yet.</span>`;
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--text-faint)">Could not load backups.</span>`;
+  }
 }
 
 function applyAccent(color) {
   localStorage.setItem("ls-accent", color);
   document.documentElement.style.setProperty("--accent", color);
   document.documentElement.style.setProperty("--accent-hover", color);
+}
+
+/* -------------------------------------------------------------------------
+ * Playlists
+ * ---------------------------------------------------------------------- */
+
+async function renderPlaylists() {
+  const seq = state._renderSeq;
+  view.innerHTML = spinner();
+  let data;
+  try { data = await api("/api/playlists"); } catch (e) { view.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`; return; }
+  if (seq !== state._renderSeq) return;
+
+  const custom = data.custom || [];
+  const ytm = data.ytm || {};
+
+  let html = `
+    <div class="section-head"><h2>Playlists</h2></div>
+    <div class="filter-bar">
+      <button id="pl-new" class="btn btn-primary">&#43; New playlist</button>
+      <button id="pl-import" class="btn btn-ghost">&#8681; Import (M3U / JSON / Spotify)</button>
+      ${Object.keys(ytm).length ? `<button id="pl-sync" class="btn btn-ghost">&#8635; Sync YT Music playlists</button>` : ""}
+    </div>`;
+
+  const customPl = custom.filter((p) => p.kind === "custom");
+  const smartPl = custom.filter((p) => p.kind === "smart");
+
+  if (customPl.length) {
+    html += `<div class="section-head" style="margin-top:18px"><h3>Custom playlists</h3></div>
+      <div class="card-grid">
+        ${customPl.map((p) => `
+          <a href="#/playlist/${encodeURIComponent(p.id)}" style="text-decoration:none;color:inherit">
+            <div class="card">
+              <div class="card-art" style="background:linear-gradient(135deg,#1f1c2c,#928dab);font-size:34px;display:flex;align-items:center;justify-content:center;color:#fff">&#9835;</div>
+              <div class="card-title">${esc(p.name)}</div>
+              <div class="card-sub">${p.track_count} track${p.track_count === 1 ? "" : "s"}</div>
+            </div>
+          </a>`).join("")}
+      </div>`;
+  }
+
+  if (smartPl.length) {
+    html += `<div class="section-head" style="margin-top:18px"><h3>Smart playlists</h3></div>
+      <div class="card-grid">
+        ${smartPl.map((p) => `
+          <a href="#/playlist/${encodeURIComponent(p.id)}" style="text-decoration:none;color:inherit">
+            <div class="card">
+              <div class="card-art" style="background:linear-gradient(135deg,#134e5e,#71b280);font-size:34px;display:flex;align-items:center;justify-content:center;color:#fff">&#9881;</div>
+              <div class="card-title">${esc(p.name)}</div>
+              <div class="card-sub">${p.track_count} track${p.track_count === 1 ? "" : "s"} · auto</div>
+            </div>
+          </a>`).join("")}
+      </div>`;
+  }
+
+  if (!customPl.length && !smartPl.length) {
+    html += `<div class="empty-state" style="padding:24px"><div class="big">&#9835;</div>No custom playlists yet. Create one to group tracks.</div>`;
+  }
+
+  for (const [slug, playlists] of Object.entries(ytm)) {
+    const acc = (state.library?.accounts || []).find((a) => a.slug === slug);
+    const name = acc?.name || slug;
+    html += `<div class="section-head" style="margin-top:18px"><h3>YouTube Music — ${esc(name)}</h3></div>
+      ${playlists.length ? `<div class="card-grid">
+        ${playlists.map((p) => `
+          <a href="#/playlist/ytm/${encodeURIComponent(slug)}/${encodeURIComponent(p.id)}" style="text-decoration:none;color:inherit">
+            <div class="card">
+              <div class="card-art" style="background:linear-gradient(135deg,#283c86,#45a247);font-size:34px;display:flex;align-items:center;justify-content:center;color:#fff">&#9654;</div>
+              <div class="card-title">${esc(p.title || p.id)}</div>
+              <div class="card-sub">${p.count ?? ""} tracks</div>
+            </div>
+          </a>`).join("")}
+      </div>` : `<div class="empty-state" style="padding:20px">No synced playlists for this account.</div>`}`;
+  }
+
+  view.innerHTML = html;
+
+  $("#pl-new").onclick = () => {
+    const accs = state.library?.accounts || [];
+    const promise = modal("New playlist", `
+      <div class="label">Name</div>
+      <input name="name" class="input" type="text" placeholder="e.g. Road trip 2026" />
+      <div class="label">Type</div>
+      <select name="kind" class="input">
+        <option value="custom">Custom — hand-picked tracks</option>
+        <option value="smart">Smart — auto-matching rules</option>
+      </select>
+      <div class="label">Account (optional — restricts which account's tracks it matches)</div>
+      <select name="account" class="input">
+        <option value="">All accounts</option>
+        ${accs.map((a) => `<option value="${esc(a.slug)}">${esc(a.name)}</option>`).join("")}
+      </select>
+      <div id="smart-rules" style="display:none;margin-top:12px">
+        <div class="label">Artist contains</div><input name="artist" class="input" type="text" />
+        <div class="label">Genre contains</div><input name="genre" class="input" type="text" />
+        <div class="label">Title contains</div><input name="title" class="input" type="text" />
+        <div class="label">Album contains</div><input name="album" class="input" type="text" />
+        <div class="filter-bar">
+          <div style="flex:1"><div class="label">Min plays</div><input name="min_plays" class="input" type="number" min="0" /></div>
+          <div style="flex:1"><div class="label">Max plays</div><input name="max_plays" class="input" type="number" min="0" /></div>
+        </div>
+        <div class="filter-bar">
+          <div style="flex:1"><div class="label">Year</div><input name="year" class="input" type="number" min="1900" max="2100" /></div>
+          <div style="flex:1"><div class="label">Max tracks</div><input name="max_count" class="input" type="number" min="1" /></div>
+        </div>
+        <div class="label">Status</div>
+        <select name="status" class="input"><option value="">Any</option><option value="downloaded">Downloaded</option><option value="missing">Missing files</option><option value="premium">Premium-locked</option></select>
+      </div>`,
+      [
+        { label: "Cancel", value: () => false },
+        { label: "Create", variant: "btn-primary", value: () => {
+          const kind = $("#modal-root select[name=kind]").value;
+          const rules = {};
+          if (kind === "smart") {
+            const get = (n) => $("#modal-root input[name=" + n + "]")?.value?.trim();
+            const num = (n) => { const v = get(n); return v === "" ? undefined : Number(v); };
+            rules.account = $("#modal-root select[name=account]").value || undefined;
+            rules.status = $("#modal-root select[name=status]").value || undefined;
+            rules.artist = get("artist"); rules.genre = get("genre"); rules.title = get("title"); rules.album = get("album");
+            rules.min_plays = num("min_plays"); rules.max_plays = num("max_plays");
+            rules.year = num("year"); rules.max_count = num("max_count");
+          }
+          return { name: $("#modal-root input[name=name]").value.trim(), kind, account: rules.account, rules };
+        } },
+      ]);
+    $("#modal-root select[name=kind]").onchange = () => {
+      $("#smart-rules").style.display = $("#modal-root select[name=kind]").value === "smart" ? "block" : "none";
+    };
+    promise.then((value) => { if (value) createPlaylist(value); });
+  };
+
+  $("#pl-import").onclick = () => {
+    const accs = state.library?.accounts || [];
+    const promise = modal("Import playlist", `
+      <div class="label">Source</div>
+      <select name="type" class="input">
+        <option value="m3u">M3U file contents</option>
+        <option value="json">LocalSpot JSON export</option>
+        <option value="spotify">Spotify playlist URL</option>
+      </select>
+      <div class="label">Name (m3u only)</div>
+      <input name="name" class="input" type="text" placeholder="Imported playlist" />
+      <div id="import-acc-wrap" style="display:none"><div class="label">Account (spotify import matching)</div>
+        <select name="account" class="input"><option value="">All accounts</option>${accs.map((a) => `<option value="${esc(a.slug)}">${esc(a.name)}</option>`).join("")}</select>
+      </div>
+      <div class="label" id="content-label">M3U contents (paths or URLs)</div>
+      <textarea name="content" class="input" style="min-height:140px" placeholder="Paste file contents here…"></textarea>`,
+      [
+        { label: "Cancel", value: () => false },
+        { label: "Import", variant: "btn-primary", value: () => ({
+          type: $("#modal-root select[name=type]").value,
+          name: $("#modal-root input[name=name]").value.trim(),
+          account: $("#modal-root select[name=account]")?.value,
+          content: $("#modal-root textarea[name=content]").value,
+        }) },
+      ]);
+    const setUI = () => {
+      const t = $("#modal-root select[name=type]").value;
+      $("#import-acc-wrap").style.display = t === "spotify" ? "block" : "none";
+      $("#content-label").textContent = t === "spotify" ? "Spotify playlist URL" : (t === "json" ? "JSON export contents" : "M3U contents (paths or URLs)");
+    };
+    $("#modal-root select[name=type]").onchange = setUI;
+    setUI();
+    promise.then((value) => { if (value) importPlaylist(value); });
+  };
+
+  $("#pl-sync")?.addEventListener("click", async () => {
+    try {
+      await api("/api/playlists/sync", { method: "POST", body: {} });
+      toast("Playlist sync started", "info");
+      setTimeout(renderPlaylists, 2500);
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+
+async function createPlaylist(config) {
+  if (!config?.name) { toast("Playlist name is required", "error"); return; }
+  try {
+    await api("/api/playlists", {
+      method: "POST",
+      body: { name: config.name, kind: config.kind, account: config.account, rules: config.kind === "smart" ? config.rules : undefined },
+    });
+    toast(`Playlist “${config.name}” created`, "success");
+    renderPlaylists();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function importPlaylist(config) {
+  try {
+    const body = { type: config.type, name: config.name || undefined };
+    if (config.type === "spotify") { body.url = config.content.trim(); body.account = config.account; }
+    else body.content = config.content;
+    const r = await api("/api/playlists/import", { method: "POST", body });
+    const matched = r.matched?.length ?? null;
+    toast(matched === null ? `Imported “${r.name}”` : `Imported “${r.name}” — ${matched} matched, ${r.unmatched ?? 0} unmatched`, "success");
+    location.hash = `#/playlist/${r.id}`;
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function renderPlaylistDetail(id, slug, ytmId) {
+  const seq = state._renderSeq;
+  view.innerHTML = spinner();
+  let playlist;
+  let isYtm = false;
+  try {
+    if (slug) {
+      playlist = await api(`/api/playlists/ytm/${slug}/${ytmId}`);
+      isYtm = true;
+    } else {
+      playlist = await api(`/api/playlists/${id}`);
+    }
+  } catch (e) { view.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`; return; }
+  if (seq !== state._renderSeq) return;
+
+  const tracks = playlist.tracks || [];
+  const kind = isYtm ? "ytm" : playlist.kind;
+  const title = esc(playlist.name);
+
+  view.innerHTML = `
+    <div class="section-head">
+      <h2>${title} <span style="color:var(--text-faint);font-weight:600;font-size:14px">${tracks.length} track${tracks.length === 1 ? "" : "s"}</span></h2>
+      <div class="filter-bar" style="margin-top:10px">
+        <button id="pl-play" class="btn btn-primary">&#9654; Play all</button>
+        ${isYtm
+          ? `<button id="pl-dl" class="btn btn-ghost">&#8681; Download playlist</button>`
+          : (kind === "custom"
+            ? `<button id="pl-export" class="btn btn-ghost">&#8681; Export</button>
+               <button id="pl-rename" class="btn btn-ghost">&#9998; Rename</button>
+               <button id="pl-delete" class="btn btn-danger">&#128465; Delete</button>`
+            : `<button id="pl-export" class="btn btn-ghost">&#8681; Export</button>
+               <button id="pl-delete" class="btn btn-danger">&#128465; Delete</button>`)}
+      </div>
+    </div>
+    ${kind === "smart" ? `<div class="alert alert-info">Smart playlist — tracks match its rules automatically. Rules: ${esc(JSON.stringify(playlist.rules || {}))}</div>` : ""}
+    ${tracks.length
+      ? trackTable(tracks, { emptyText: "No tracks in this playlist." })
+      : empty("This playlist has no tracks yet.")}`;
+
+  $("#pl-play").onclick = () => {
+    const queueable = tracks.filter((t) => t.stream);
+    if (!queueable.length) { toast("Nothing playable in this playlist", "info"); return; }
+    setQueue(queueable, 0);
+  };
+
+  const dlBtn = $("#pl-dl");
+  if (dlBtn) {
+    dlBtn.onclick = async () => {
+      const config = await downloadDialog({ account: slug, title: `Download “${playlist.name}”` });
+      if (!config) return;
+      try {
+        await startDownload({ ...config, session: "once", output: "playlist", playlist_id: ytmId });
+        toast(`Downloading playlist…`, "info");
+      } catch (e) { toast(e.message, "error"); }
+    };
+  }
+
+  const exportBtn = $("#pl-export");
+  if (exportBtn) {
+    exportBtn.onclick = async () => {
+      const fmt = await modal("Export playlist", `
+        <div class="label">Format</div>
+        <select name="fmt" class="input"><option value="m3u">M3U (paths to local files)</option><option value="json">JSON</option><option value="csv">CSV</option></select>`,
+        [
+          { label: "Cancel", value: () => false },
+          { label: "Export", variant: "btn-primary", value: () => $("#modal-root select[name=fmt]").value },
+        ]);
+      if (!fmt) return;
+      try {
+        const r = await api(`/api/playlists/${id}/export`, { method: "POST", body: { format: fmt } });
+        toast(`Exported to ${r.file}`, "success");
+      } catch (e) { toast(e.message, "error"); }
+    };
+  }
+
+  const renameBtn = $("#pl-rename");
+  if (renameBtn) {
+    renameBtn.onclick = async () => {
+      const name = await modal("Rename playlist", `<div class="label">Name</div><input name="name" class="input" type="text" value="${esc(playlist.name)}" />`,
+        [
+          { label: "Cancel", value: () => false },
+          { label: "Save", variant: "btn-primary", value: () => $("#modal-root input[name=name]").value.trim() },
+        ]);
+      if (!name) return;
+      try {
+        await api(`/api/playlists/${id}/update`, { method: "POST", body: { name } });
+        toast("Renamed", "success");
+        navigate();
+      } catch (e) { toast(e.message, "error"); }
+    };
+  }
+
+  const deleteBtn = $("#pl-delete");
+  if (deleteBtn) {
+    deleteBtn.onclick = async () => {
+      const ok = await confirmModal("Delete playlist", `${playlist.name} will be deleted. Tracks are not removed from your library.`);
+      if (!ok) return;
+      try {
+        await api(`/api/playlists/${id}`, { method: "DELETE" });
+        toast("Playlist deleted", "info");
+        location.hash = "#/playlists";
+      } catch (e) { toast(e.message, "error"); }
+    };
+  }
+
+  bindTrackTable(view, tracks);
+}
+
+/* -------------------------------------------------------------------------
+ * Stats
+ * ---------------------------------------------------------------------- */
+
+async function renderStats() {
+  const seq = state._renderSeq;
+  view.innerHTML = spinner();
+  let data;
+  try { data = await api("/api/stats"); } catch (e) { view.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`; return; }
+  if (seq !== state._renderSeq) return;
+
+  const perAccount = data.per_account || {};
+  const recent = data.recent || [];
+
+  let html = `
+    <div class="section-head"><h2>Listening stats</h2></div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="stat-value">${data.total_plays?.toLocaleString() || 0}</div><div class="stat-label">Total plays</div></div>
+      <div class="stat-card"><div class="stat-value">${data.unique_tracks || 0}</div><div class="stat-label">Unique tracks</div></div>
+    </div>
+    <div class="section-head" style="margin-top:18px"><h3>History</h3>
+      <div class="filter-bar" style="margin:0">
+        ${[7, 30, 90].map((d) => `<button class="btn btn-ghost hist-range" data-days="${d}">${d}d</button>`).join("")}
+      </div>
+    </div>
+    <div id="history-view"><div class="empty-state" style="padding:20px">Loading history…</div></div>`;
+
+  if (Object.keys(perAccount).length) {
+    html += `<div class="section-head" style="margin-top:18px"><h3>Plays by account</h3></div>
+      <div class="panel">
+        ${Object.entries(perAccount).map(([slug, count]) => {
+          const acc = (state.library?.accounts || []).find((a) => a.slug === slug);
+          return `<div class="check-row"><strong>${esc(acc?.name || slug)}</strong><span style="margin-left:auto;color:var(--text-dim)">${count.toLocaleString()} play${count === 1 ? "" : "s"}</span></div>`;
+        }).join("")}
+      </div>`;
+  }
+
+  if (recent.length) {
+    html += `<div class="section-head" style="margin-top:18px"><h3>Recent listens</h3></div>
+      <div class="panel">
+        ${recent.slice(0, 20).map((r) => {
+          const t = (state.library?.tracks || []).find((x) => x.id === r.video_id && x.account === r.account);
+          return `<div class="check-row"><span style="color:var(--text-faint);width:60px;font-size:12px">${new Date((r.ts || 0) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span><strong>${esc(t?.title || r.video_id)}</strong><span style="color:var(--text-dim);margin-left:auto">${esc(r.account)}</span></div>`;
+        }).join("")}
+      </div>`;
+  }
+
+  if (!(data.total_plays || 0) && !recent.length) {
+    html += `<div class="empty-state" style="padding:24px"><div class="big">&#9654;</div>No listening data yet. Play some tracks — plays are counted once you reach 60% of a song.</div>`;
+  }
+
+  view.innerHTML = html;
+
+  bindTrackTable(view, (state.library?.tracks || []).filter((t) => t.stream));
+
+  const loadHistory = async (days) => {
+    const box = $("#history-view");
+    if (!box) return;
+    const hseq = ++state._historySeq;
+    box.innerHTML = `<div class="empty-state" style="padding:20px">Loading…</div>`;
+    let h;
+    try { h = await api(`/api/history?days=${days}`); } catch (e) {
+      if (hseq === state._historySeq) box.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+      return;
+    }
+    if (hseq !== state._historySeq) return;
+
+    const perDay = h.per_day || {};
+    const daysList = Object.entries(perDay);
+    const maxDay = Math.max(1, ...daysList.map(([, v]) => v));
+    const topTracks = h.top_tracks || [];
+    const topArtists = h.top_artists || [];
+    const topAlbums = h.top_albums || [];
+
+    let hh = "";
+    if (daysList.length) {
+      hh += `<div class="panel"><div class="bar-chart">
+        ${daysList.map(([day, count]) => `
+          <div class="bar-col" title="${esc(day)}: ${count} play${count === 1 ? "" : "s"}">
+            <div class="bar-fill" style="height:${Math.max(4, Math.round((count / maxDay) * 120))}px"></div>
+            <div class="bar-label">${day.slice(5)}</div>
+          </div>`).join("")}
+      </div></div>`;
+    }
+
+    if (topTracks.length) {
+      hh += `<div class="section-head" style="margin-top:18px"><h3>Most played tracks — last ${days} days</h3></div>
+        <div class="panel"><table class="tracks"><thead><tr><th>#</th><th>Title</th><th>Plays</th></tr></thead><tbody>
+          ${topTracks.map((t, i) => `
+            <tr data-id="${esc(t.id)}" data-account="${esc(t.account)}">
+              <td style="color:var(--text-faint)">${i + 1}</td>
+              <td><div class="track-cell"><div class="mini-art" data-name="${esc(t.artist)}">
+                ${t.art ? `<img src="${esc(t.art)}" loading="lazy" onerror="this.outerHTML=artPlaceholderFor(this)"/>` : artPlaceholder(t.artist)}
+              </div><div class="t-main"><div class="t-title">${esc(t.title)}</div><div class="t-sub">${esc(t.artist)}</div></div></div></td>
+              <td style="color:var(--text-dim)">${t.plays} play${t.plays === 1 ? "" : "s"}</td>
+            </tr>`).join("")}
+        </tbody></table></div>`;
+    }
+
+    if (topArtists.length) {
+      hh += `<div class="section-head" style="margin-top:18px"><h3>Most played artists — last ${days} days</h3></div>
+        <div class="panel">
+          ${topArtists.map((a, i) => `<div class="check-row"><span style="color:var(--text-faint);width:26px">${i + 1}</span><strong>${esc(a.artist)}</strong><span style="margin-left:auto;color:var(--text-dim)">${a.plays} play${a.plays === 1 ? "" : "s"}</span></div>`).join("")}
+        </div>`;
+    }
+
+    if (topAlbums.length) {
+      hh += `<div class="section-head" style="margin-top:18px"><h3>Most played albums — last ${days} days</h3></div>
+        <div class="panel">
+          ${topAlbums.map((a, i) => `<div class="check-row"><span style="color:var(--text-faint);width:26px">${i + 1}</span><strong>${esc(a.album)}</strong><span style="margin-left:auto;color:var(--text-dim)">${a.plays} play${a.plays === 1 ? "" : "s"}</span></div>`).join("")}
+        </div>`;
+    }
+
+    if (!daysList.length && !topTracks.length) {
+      hh = `<div class="empty-state" style="padding:20px">No plays in the last ${days} days.</div>`;
+    }
+
+    box.innerHTML = hh;
+    if (topTracks.length) bindTrackTable(box, topTracks.map((t) => ({ ...t, id: t.id, stream: true })));
+  };
+
+  state._historySeq = 0;
+  $$(".hist-range", view).forEach((btn) => {
+    btn.onclick = () => {
+      $$(".hist-range", view).forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      loadHistory(Number(btn.dataset.days));
+    };
+  });
+  loadHistory(30);
 }
 
 /* -------------------------------------------------------------------------
@@ -1652,6 +2612,18 @@ function renderSearchResults(query) {
       </a>`).join("");
   }
 
+  const accounts = state.library ? state.library.accounts : [];
+  html += `
+    <div class="dup-title" style="padding:10px 18px 4px;display:flex;align-items:center;gap:8px">
+      <span>YouTube Music</span>
+      <select id="ytm-account" class="input" style="width:auto;margin-left:auto;font-size:12px;padding:4px 8px;height:auto">
+        ${state.scope !== "all"
+          ? `<option value="${esc(state.scope)}">${esc(selectedAccountName())}</option>`
+          : `<option value="">All accounts</option>${accounts.map((a) => `<option value="${esc(a.slug)}">${esc(a.name)}</option>`).join("")}`}
+      </select>
+    </div>
+    <div id="ytm-results"><div class="empty-state" style="padding:16px;font-size:13px">Searching YouTube Music…</div></div>`;
+
   box.innerHTML = html || `<div class="empty-state" style="padding:26px">No matches for “${esc(q)}”.</div>`;
 
   $$(".search-row[data-type=song]", box).forEach((row) => {
@@ -1666,6 +2638,126 @@ function renderSearchResults(query) {
   box.onclick = (e) => {
     if (e.target.closest("a")) closeSearch();
   };
+
+  populateYTMSearch(q);
+}
+
+let _ytmSearchSeq = 0;
+async function populateYTMSearch(query) {
+  const box = $("#ytm-results");
+  if (!box) return;
+  const seq = ++_ytmSearchSeq;
+  const results = [];
+  const accountNames = {};
+  (state.library?.accounts || []).forEach((a) => { accountNames[a.slug] = a.name; });
+  try {
+    const sel = $("#ytm-account");
+    const allSlugs = (state.library?.accounts || []).map((a) => a.slug);
+    let accountsParam = "";
+    if (sel) {
+      const v = sel.value;
+      if (v) accountsParam = encodeURIComponent(v);
+      else if (state.scope !== "all" && state.scope) accountsParam = encodeURIComponent(state.scope);
+      else if (allSlugs.length) accountsParam = encodeURIComponent(allSlugs.join(","));
+    }
+    const data = await api(`/api/search?q=${encodeURIComponent(query)}&limit=8${accountsParam ? `&accounts=${accountsParam}` : ""}`);
+    if (Array.isArray(data)) results.push(...data);
+    else if (Array.isArray(data.results)) results.push(...data.results);
+    else if (Array.isArray(data.tracks)) results.push(...data.tracks);
+  } catch (e) {
+    if (seq === _ytmSearchSeq) box.innerHTML = `<div class="empty-state" style="padding:16px;font-size:13px">Search failed: ${esc(e.message)}</div>`;
+    return;
+  }
+  if (seq !== _ytmSearchSeq) return;
+
+  if (!results.length) {
+    box.innerHTML = `<div class="empty-state" style="padding:16px;font-size:13px">No YouTube Music results.</div>`;
+    return;
+  }
+
+  const rows = results.map((r) => {
+    const title = r.title || "Untitled";
+    const artist = (r.artists || []).map((a) => a.name || a).join(", ") || "Unknown Artist";
+    const album = r.album ? (r.album.name || r.album) : null;
+    const dur = r.duration ? fmtDuration(r.duration) : "";
+    const accs = Array.isArray(r.accounts) ? r.accounts : [];
+    const owned = Array.isArray(r.owned_by) ? r.owned_by : [];
+    const ownedNote = owned.length
+      ? ` <span style="color:var(--accent)">&#10003; ${owned.map((s) => accountNames[s] || s).join(", ")}</span>`
+      : "";
+    return `
+      <div class="search-row ytm-row" data-vid="${esc(r.videoId)}">
+        <div class="mini-art">${artPlaceholder(title)}</div>
+        <div class="s-type">YTM</div>
+        <div style="flex:1;min-width:0"><div class="s-title">${esc(title)}</div><div class="s-sub">${esc(artist)}${album ? ` — ${esc(album)}` : ""}${dur ? ` · ${dur}` : ""}${ownedNote}</div></div>
+        <button class="btn btn-ghost ytm-dl" style="padding:6px 12px;font-size:12px" data-vid="${esc(r.videoId)}" data-title="${esc(title)}" data-artist="${esc(artist)}" data-album="${esc(album || "")}">&#8681;</button>
+      </div>`;
+  }).join("");
+
+  box.innerHTML = `<div class="ytm-bar"><button id="ytm-dl-all" class="btn btn-primary" style="padding:6px 14px;font-size:12.5px">&#8681; Download ${results.length} result${results.length === 1 ? "" : "s"}</button></div>` + rows;
+
+  const accountFor = () => $("#ytm-account").value || null;
+
+  $("#ytm-dl-all").onclick = () => {
+    const tracks = results.map((r) => ({
+      videoId: r.videoId,
+      title: r.title || "",
+      artists: (r.artists || []).map((a) => ({ name: a.name || a })),
+      album: r.album ? (r.album.name || r.album) : null,
+    }));
+    downloadSearchTracks(tracks, accountFor());
+  };
+
+  $$(".ytm-dl", box).forEach((btn) => {
+    btn.onclick = () => {
+      const t = results.find((r) => r.videoId === btn.dataset.vid);
+      if (!t) return;
+      const targets = Array.isArray(t.accounts) && t.accounts.length ? t.accounts : null;
+      downloadSearchTracks([{
+        videoId: t.videoId,
+        title: t.title || "",
+        artists: (t.artists || []).map((a) => ({ name: a.name || a })),
+        album: t.album ? (t.album.name || t.album) : null,
+      }], accountFor(), targets);
+    };
+  });
+}
+
+async function downloadSearchTracks(tracks, accountSlug, preferredAccounts = null) {
+  if (!tracks.length) return;
+  const accounts = state.library ? state.library.accounts : [];
+  let target = accountSlug || null;
+
+  if (!target && preferredAccounts && preferredAccounts.length) {
+    const usable = preferredAccounts.filter((s) => accounts.some((a) => a.slug === s));
+    if (usable.length === 1) target = usable[0];
+  }
+
+  if (!target) {
+    if (!accounts.length) { toast("Add an account first", "error"); return; }
+    const picked = await modal("Download to account", `
+      <div class="label">Account</div>
+      <select name="account" class="input">${accounts.map((a) => `<option value="${esc(a.slug)}">${esc(a.name)}</option>`).join("")}</select>`,
+      [
+        { label: "Cancel", value: () => false },
+        { label: "Continue", variant: "btn-primary", value: () => $("#modal-root select[name=account]").value },
+      ]);
+    if (!picked) return;
+    target = picked;
+  }
+  const config = await downloadDialog({ account: target, title: `Download ${tracks.length} search result${tracks.length === 1 ? "" : "s"}` });
+  if (!config) return;
+  try {
+    await startDownload({
+      account: target,
+      quality: config.quality,
+      existing_policy: config.existing_policy,
+      session: config.session,
+      output: "search",
+      tracks,
+    });
+    toast(`Downloading ${tracks.length} search result${tracks.length === 1 ? "" : "s"}…`, "info");
+  } catch (e) { toast(e.message, "error"); }
 }
 
 /* -------------------------------------------------------------------------
@@ -1685,6 +2777,8 @@ const routes = {
   downloads: renderDownloads,
   accounts: renderAccounts,
   settings: renderSettings,
+  playlists: renderPlaylists,
+  stats: renderStats,
 };
 
 async function navigate() {
@@ -1702,7 +2796,7 @@ async function navigate() {
     home: "Home", songs: "All Songs", artists: "Artists", albums: "Albums",
     years: "Years", genres: "Genres", "most-played": "Most Played",
     duplicates: "Duplicates", status: "Library Status", downloads: "Downloads",
-    accounts: "Accounts", settings: "Settings",
+    accounts: "Accounts", settings: "Settings", playlists: "Playlists", stats: "Stats",
   };
   topbarTitle.textContent = titles[key] || "Home";
 
@@ -1713,6 +2807,10 @@ async function navigate() {
     if (key === "album" && rest[0]) return renderAlbum(decodeURIComponent(rest[0]));
     if (key === "year" && rest[0]) return renderYear(Number(rest[0]));
     if (key === "genre" && rest[0]) return renderGenre(decodeURIComponent(rest[0]));
+    if (key === "playlist" && rest.length) {
+      if (rest[0] === "ytm" && rest.length >= 3) return renderPlaylistDetail(null, decodeURIComponent(rest[1]), decodeURIComponent(rest[2]));
+      return renderPlaylistDetail(decodeURIComponent(rest[0]));
+    }
     const fn = routes[key];
     if (fn) {
       await fn();
@@ -1805,6 +2903,15 @@ function connectEvents() {
       return;
     }
 
+    if (data.type === "play_recorded") {
+      if (state.library) {
+        const hit = state.library.tracks.find((t) => t.id === data.video_id && t.account === data.slug);
+        if (hit && typeof data.total === "number") hit.plays = data.total;
+      }
+      if (state.route === "stats" || state.route === "home") navigate();
+      return;
+    }
+
     if (data.type === "session_update") {
       const s = data.session;
       state.downloads[s.slug] = s;
@@ -1824,7 +2931,8 @@ function connectEvents() {
       }, 8000);
       const detail = `${data.downloaded} downloaded, ${data.failed} failed, ${data.skipped} skipped`;
       toast(`Download finished — ${detail}`, data.failed ? "info" : "success");
-      loadLibrary().then(() => { if (state.route === "songs" || state.route === "home") navigate(); });
+      notify(data.name ? `Download finished: ${data.name}` : "Download finished", detail);
+      loadLibrary().then(() => { if (["songs", "home", "playlists", "stats", "duplicates", "status"].includes(state.route)) navigate(); });
       return;
     }
 
@@ -1832,7 +2940,8 @@ function connectEvents() {
       delete state.refreshing[data.slug];
       renderAccountsNav();
       toast(`${data.slug} refreshed (${data.liked_count ?? "?"} liked tracks)`, "success");
-      loadLibrary().then(() => { if (state.route === "home" || state.route === "songs") navigate(); });
+      notify(`${data.slug} refreshed`, `${data.liked_count ?? "?"} liked tracks`);
+      loadLibrary().then(() => { if (["home", "songs", "playlists", "stats", "status"].includes(state.route)) navigate(); });
       return;
     }
 
@@ -1840,6 +2949,29 @@ function connectEvents() {
       delete state.refreshing[data.slug];
       renderAccountsNav();
       toast(`${data.slug}: refresh failed — ${data.error}`, "error");
+      notify(`${data.slug}: refresh failed`, data.error);
+      return;
+    }
+
+    if (data.type === "auto_download_started") {
+      toast(`Auto-download started for ${data.slug} (${data.count} tracks)`, "info");
+      return;
+    }
+    if (data.type === "premium_retry_started") {
+      toast(`Premium retry started for ${data.slug} (${data.count} tracks)`, "info");
+      return;
+    }
+    if (data.type === "backup_written") {
+      toast(`Backup written to ${data.file}`, "info");
+      return;
+    }
+    if (data.type === "ytdlp_update_check") {
+      if (data.update_available) toast(`yt-dlp update available: ${data.current} → ${data.latest}`, "info");
+      return;
+    }
+    if (data.type === "scrobble_flush") {
+      if (data.sent) toast(`Scrobbled ${data.sent} track${data.sent === 1 ? "" : "s"} to last.fm`, "success");
+      if (data.error) toast(`last.fm scrobble error: ${data.error}`, "error");
     }
   };
   source.onerror = () => {
@@ -1857,11 +2989,15 @@ function wirePlayer() {
   $("#btn-play").onclick = togglePlay;
   $("#btn-next").onclick = next;
   $("#btn-prev").onclick = prev;
-  $("#btn-shuffle").onclick = () => { state.player.shuffle = !state.player.shuffle; updatePlayerUI(); };
+  $("#btn-shuffle").onclick = () => { state.player.shuffle = !state.player.shuffle; updatePlayerUI(); persistPlayer(); };
   $("#btn-repeat").onclick = () => {
     state.player.repeat = state.player.repeat === "off" ? "all" : state.player.repeat === "all" ? "one" : "off";
     updatePlayerUI();
+    persistPlayer();
   };
+  $("#btn-sleep").onclick = sleepTimerDialog;
+  $("#btn-queue").onclick = toggleQueueDrawer;
+  $("#btn-queue-close").onclick = toggleQueueDrawer;
 
   const seek = $("#seek");
   seek.addEventListener("pointerdown", () => { seek.dataset.seeking = "1"; });
@@ -1981,6 +3117,7 @@ async function init() {
   } catch (e) {
     $("#view").innerHTML = `<div class="alert alert-error">Failed to load library: ${esc(e.message)}</div>`;
   }
+  restorePlayer();
   navigate();
 }
 
