@@ -45,6 +45,7 @@ from __future__ import annotations
 # ============================================================================
 
 import importlib
+import hashlib
 import json
 import platform
 import re
@@ -60,8 +61,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "5.0.2"
-APP_BUILD = "2026-08-14-web-smart-downloads"
+APP_VERSION = "6.2.0"
+APP_BUILD = "2026-08-15-player-restore"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -401,6 +402,18 @@ DEFAULT_SETTINGS = {
     "default_limit": 25,
     "retry_attempts": 3,
     "retry_delay": 3,
+    "auto_refresh_interval_hours": 0,
+    "auto_download_new_likes": False,
+    "premium_retry_interval_days": 7,
+    "max_parallel_downloads": 1,
+    "download_rate_limit": "",
+    "backup_interval_hours": 0,
+    "notifications_enabled": True,
+    "lastfm_enabled": False,
+    "lastfm_api_key": "",
+    "lastfm_api_secret": "",
+    "lastfm_username": "",
+    "lastfm_password_md5": "",
 }
 
 
@@ -1145,6 +1158,437 @@ def save_most_played_list(
 
 
 # ============================================================================
+# Search / playlists / auth health
+# ============================================================================
+
+def search_tracks(
+    query: str,
+    limit: int = 10,
+    account: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Search YouTube Music for tracks. When an account is supplied the
+    search runs authenticated (matching the liked-library shapes);
+    otherwise it runs anonymously with a default browser session.
+    """
+    from ytmusicapi import YTMusic
+
+    if account is not None:
+        ytm = YTMusic(
+            str(account["auth"])
+        )
+    else:
+        ytm = YTMusic()
+
+    try:
+        results = ytm.search(
+            query,
+            filter="songs",
+            limit=int(limit),
+        )
+    except Exception:
+        results = ytm.search(
+            query,
+            limit=int(limit),
+        )
+
+    tracks = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        video_id = item.get("videoId")
+        if not video_id:
+            continue
+        if "lyrics" in video_id:
+            continue
+        tracks.append(item)
+
+    return tracks
+
+
+def fetch_library_playlists(
+    account: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Fetch the account's YouTube Music playlists (library scope).
+    Returns lightweight summaries; tracks are fetched separately.
+    """
+    from ytmusicapi import YTMusic
+
+    ytm = YTMusic(
+        str(account["auth"])
+    )
+
+    playlists = ytm.get_library_playlists(
+        100
+    )
+
+    result = []
+
+    for playlist in playlists:
+        if not isinstance(playlist, dict):
+            continue
+
+        playlist_id = playlist.get(
+            "playlistId"
+        )
+
+        if not playlist_id:
+            continue
+
+        result.append(
+            {
+                "id": playlist_id,
+                "title": playlist.get(
+                    "title",
+                    "Untitled playlist",
+                ),
+                "description": playlist.get(
+                    "description",
+                    "",
+                ),
+                "count": int(
+                    playlist.get(
+                        "count",
+                        0,
+                    ) or 0
+                ),
+                "year": playlist.get(
+                    "year",
+                ),
+                "author": playlist.get(
+                    "author",
+                ),
+            }
+        )
+
+    return result
+
+
+def fetch_playlist_tracks(
+    account: dict[str, Any],
+    playlist_id: str,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """
+    Fetch all tracks in a YouTube Music playlist. Paginates until the
+    playlist is exhausted or `limit` is reached.
+    """
+    from ytmusicapi import YTMusic
+
+    ytm = YTMusic(
+        str(account["auth"])
+    )
+
+    tracks = []
+    continuation = None
+
+    while True:
+        try:
+            page = ytm.get_playlist(
+                playlist_id,
+                limit=min(
+                    100,
+                    max(1, limit - len(tracks)),
+                ),
+                related=(
+                    False
+                    if continuation is None
+                    else continuation
+                ),
+            )
+        except TypeError:
+            page = ytm.get_playlist(
+                playlist_id,
+                limit=min(
+                    100,
+                    max(1, limit - len(tracks)),
+                ),
+            )
+
+        page_tracks = page.get(
+            "tracks",
+            [],
+        )
+
+        tracks.extend(page_tracks)
+
+        continuation = page.get(
+            "continuation"
+        )
+
+        if not continuation:
+            break
+
+        if len(tracks) >= limit:
+            break
+
+    return deduplicate_tracks(
+        tracks
+    )
+
+
+def sync_library_playlists(
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Fetch + cache an account's YouTube Music playlists and their
+    tracks into files/<slug>/.playlists.json. On failure the cached
+    copy is returned with online=False so the UI can hide it offline.
+    """
+    file = (
+        Path(account["output"])
+        / ".playlists.json"
+    )
+
+    snapshot = {
+        "version": 1,
+        "synced_at": int(time.time()),
+        "online": True,
+        "playlists": [],
+    }
+
+    try:
+        playlists = fetch_library_playlists(
+            account
+        )
+
+        cached = {
+            playlist["id"]: playlist
+            for playlist in snapshot["playlists"]
+        }
+
+        for playlist in playlists:
+            playlist_id = playlist["id"]
+            if playlist_id in cached:
+                playlist["tracks"] = cached[
+                    playlist_id
+                ].get("tracks", [])
+            else:
+                try:
+                    playlist["tracks"] = (
+                        fetch_playlist_tracks(
+                            account,
+                            playlist_id,
+                        )
+                    )
+                except Exception:
+                    playlist["tracks"] = []
+
+        snapshot["playlists"] = playlists
+    except Exception as error:
+        snapshot["online"] = False
+        snapshot["error"] = str(error)
+        if file.exists():
+            try:
+                return json.loads(
+                    file.read_text(encoding="utf-8")
+                )
+            except Exception:
+                pass
+
+    save_playlist_snapshot(
+        account,
+        snapshot,
+    )
+
+    return snapshot
+
+
+def save_playlist_snapshot(
+    account: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> None:
+    file = (
+        Path(account["output"])
+        / ".playlists.json"
+    )
+
+    temporary = file.with_suffix(".tmp")
+
+    with temporary.open(
+        "w",
+        encoding="utf-8",
+    ) as fh:
+        json.dump(
+            snapshot,
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    temporary.replace(file)
+
+
+def load_playlist_snapshot(
+    account: dict[str, Any],
+) -> dict[str, Any] | None:
+    file = (
+        Path(account["output"])
+        / ".playlists.json"
+    )
+
+    if not file.exists():
+        return None
+
+    try:
+        return json.loads(
+            file.read_text(encoding="utf-8")
+        )
+    except Exception:
+        return None
+
+
+def probe_auth(
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Check whether the account's stored request headers still work by
+    making a tiny authenticated call. Persists the result so the UI
+    can warn about expired cookies before a real download fails.
+    """
+    try:
+        from ytmusicapi import YTMusic
+
+        ytm = YTMusic(
+            str(account["auth"])
+        )
+        ytm.get_library_playlists(
+            1
+        )
+        health = {
+            "healthy": True,
+            "checked_at": int(time.time()),
+            "error": None,
+        }
+    except Exception as error:
+        health = {
+            "healthy": False,
+            "checked_at": int(time.time()),
+            "error": str(error),
+        }
+
+    save_auth_health(
+        account,
+        health,
+    )
+
+    return health
+
+
+def save_auth_health(
+    account: dict[str, Any],
+    health: dict[str, Any],
+) -> None:
+    metadata_file = (
+        Path(account["directory"])
+        / "account.json"
+    )
+
+    try:
+        data = {}
+        if metadata_file.exists():
+            data = json.loads(
+                metadata_file.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        data["auth_health"] = health
+
+        with metadata_file.open(
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(
+                data,
+                fh,
+                indent=2,
+                ensure_ascii=False,
+            )
+    except Exception:
+        pass
+
+
+def load_auth_health(
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    metadata_file = (
+        Path(account["directory"])
+        / "account.json"
+    )
+
+    try:
+        data = json.loads(
+            metadata_file.read_text(
+                encoding="utf-8"
+            )
+        )
+        return data.get(
+            "auth_health",
+            {
+                "healthy": None,
+                "checked_at": None,
+                "error": None,
+            },
+        )
+    except Exception:
+        return {
+            "healthy": None,
+            "checked_at": None,
+            "error": None,
+        }
+
+
+# ============================================================================
+# Library export
+# ============================================================================
+
+def export_library() -> Path:
+    """
+    Export settings plus every account's inventory and playlists into
+    a single timestamped JSON file in config/exports.
+    """
+    from web import playlists as playlists_module
+
+    snapshot = {
+        "app_version": APP_VERSION,
+        "app_build": APP_BUILD,
+        "created_at": int(time.time()),
+        "settings": load_settings(),
+        "accounts": [],
+        "playlists": playlists_module.load_custom_playlists(
+            sys.modules[__name__]
+        ),
+    }
+
+    for account in get_accounts():
+        with account_inventory_lock(
+            account["slug"]
+        ):
+            snapshot["accounts"].append(
+                {
+                    "slug": account["slug"],
+                    "name": account["name"],
+                    "inventory": load_inventory(
+                        account
+                    ),
+                    "playlists": load_playlist_snapshot(
+                        account
+                    ),
+                    "auth_health": load_auth_health(
+                        account
+                    ),
+                }
+            )
+
+    return _export_json(
+        snapshot,
+        "library",
+    )
+
+
+# ============================================================================
 # Persistent inventory
 # ============================================================================
 
@@ -1306,6 +1750,11 @@ def repair_pending_tracks(
         ):
             continue
 
+        # Premium-locked videos can never be repaired with the
+        # current account; don't burn a retry on them.
+        if is_premium_blocked(record):
+            continue
+
         album = record.get("album")
 
         track = {
@@ -1359,6 +1808,142 @@ def repair_pending_tracks(
         pending.append(track)
 
     return pending
+
+
+def verify_account_files(
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Re-check every downloaded file against the inventory.
+
+    Returns per-track results (`ok`, `missing`, `corrupt`, `size_zero`)
+    keyed by video_id. When a stored sha256 exists the file is hashed
+    and compared; otherwise only existence / size is checked so files
+    downloaded before hashing was introduced still get a verdict.
+    """
+    with account_inventory_lock(
+        account["slug"]
+    ):
+        inventory = load_inventory(
+            account
+        )
+
+    results: dict[str, Any] = {}
+
+    for video_id, record in (
+        inventory["tracks"].items()
+    ):
+        for quality, entry in (
+            record.get("qualities") or {}
+        ).items():
+            if entry.get("status") != "downloaded":
+                continue
+
+            path_value = entry.get("file")
+            if not path_value:
+                results[video_id] = {
+                    "video_id": video_id,
+                    "title": record.get("title"),
+                    "artist": record.get("artist"),
+                    "quality": quality,
+                    "status": "missing",
+                    "reason": "No file recorded in inventory",
+                }
+                continue
+
+            path = Path(path_value)
+
+            if not path.exists():
+                results[video_id] = {
+                    "video_id": video_id,
+                    "title": record.get("title"),
+                    "artist": record.get("artist"),
+                    "quality": quality,
+                    "status": "missing",
+                    "reason": "File no longer exists",
+                }
+                continue
+
+            size = path.stat().st_size
+
+            if size <= 0:
+                results[video_id] = {
+                    "video_id": video_id,
+                    "title": record.get("title"),
+                    "artist": record.get("artist"),
+                    "quality": quality,
+                    "status": "size_zero",
+                    "reason": "File is empty",
+                }
+                continue
+
+            expected = entry.get("sha256")
+
+            if expected:
+                try:
+                    actual = file_sha256(path)
+                except Exception as error:
+                    results[video_id] = {
+                        "video_id": video_id,
+                        "title": record.get("title"),
+                        "artist": record.get("artist"),
+                        "quality": quality,
+                        "status": "corrupt",
+                        "reason": f"Could not hash file: {error}",
+                    }
+                    continue
+
+                if actual != expected:
+                    results[video_id] = {
+                        "video_id": video_id,
+                        "title": record.get("title"),
+                        "artist": record.get("artist"),
+                        "quality": quality,
+                        "status": "corrupt",
+                        "reason": "SHA-256 mismatch — file was modified or truncated",
+                    }
+                    continue
+
+            results[video_id] = {
+                "video_id": video_id,
+                "title": record.get("title"),
+                "artist": record.get("artist"),
+                "quality": quality,
+                "status": "ok",
+                "reason": None,
+                "sha256": entry.get("sha256"),
+                "size_bytes": size,
+            }
+
+    summary = {
+        "ok": sum(
+            1
+            for entry in results.values()
+            if entry["status"] == "ok"
+        ),
+        "missing": sum(
+            1
+            for entry in results.values()
+            if entry["status"] == "missing"
+        ),
+        "corrupt": sum(
+            1
+            for entry in results.values()
+            if entry["status"] == "corrupt"
+        ),
+        "size_zero": sum(
+            1
+            for entry in results.values()
+            if entry["status"] == "size_zero"
+        ),
+    }
+
+    return {
+        "account": account["slug"],
+        "total": len(results),
+        "summary": summary,
+        "results": results,
+    }
 
 
 def status_file(
@@ -1431,6 +2016,9 @@ def save_status_snapshot(
             "skipped": report.get(
                 "skipped_total"
             ),
+            "premium": report.get(
+                "premium_total"
+            ),
         },
         "missing": [
             entry(item)
@@ -1443,6 +2031,13 @@ def save_status_snapshot(
             entry(item)
             for item in report.get(
                 "not_downloaded",
+                [],
+            )
+        ],
+        "premium": [
+            entry(item)
+            for item in report.get(
+                "premium",
                 [],
             )
         ],
@@ -1643,19 +2238,20 @@ def account_health_summary(
         )
 
         if liked and not has_download:
-            liked_without_download.append(
-                {
-                    "video_id": video_id,
-                    "title": record.get(
-                        "title",
-                        "Unknown Title",
-                    ),
-                    "artist": record.get(
-                        "artist",
-                        "Unknown Artist",
-                    ),
-                }
-            )
+            if not is_premium_blocked(record):
+                liked_without_download.append(
+                    {
+                        "video_id": video_id,
+                        "title": record.get(
+                            "title",
+                            "Unknown Title",
+                        ),
+                        "artist": record.get(
+                            "artist",
+                            "Unknown Artist",
+                        ),
+                    }
+                )
 
         for quality, quality_record in (
             qualities.items()
@@ -1674,6 +2270,7 @@ def account_health_summary(
             if (
                 status == "failed"
                 and liked
+                and not is_premium_blocked(record)
             ):
                 failed_on_liked.append(
                     {
@@ -1725,6 +2322,8 @@ def names_for_quality(
 def update_inventory_from_library(
     account: dict[str, Any],
     tracks: list[dict[str, Any]],
+    mark_liked: bool = True,
+    source: str = "library",
 ) -> dict[str, Any]:
     inventory = load_inventory(account)
     records = inventory["tracks"]
@@ -1753,16 +2352,24 @@ def update_inventory_from_library(
         record["artist"] = get_artist(track)
         record["album"] = get_album(track)
         record["last_seen_liked"] = now
-        record["currently_liked"] = True
+        record["currently_liked"] = bool(
+            mark_liked
+        )
+        record["source"] = (
+            source
+            if not mark_liked
+            else record.get("source", "library")
+        )
 
-    for video_id, record in records.items():
-        if video_id not in current_ids:
-            record["currently_liked"] = False
+    if mark_liked:
+        for video_id, record in records.items():
+            if video_id not in current_ids:
+                record["currently_liked"] = False
 
-    inventory["last_library_sync"] = now
-    inventory["liked_count"] = len(
-        current_ids
-    )
+        inventory["last_library_sync"] = now
+        inventory["liked_count"] = len(
+            current_ids
+        )
 
     save_inventory(
         account,
@@ -1810,6 +2417,7 @@ def scan_inventory(
     failed = []
     skipped = []
     unavailable = []
+    premium = []
 
     # Current liked tracks.
     for video_id, track in current_map.items():
@@ -1889,16 +2497,30 @@ def scan_inventory(
             )
 
         elif status == "failed":
-            failed.append(
-                {
-                    "video_id": video_id,
-                    "track": track,
-                    "reason": quality_record.get(
-                        "reason",
-                        "Previous download failed.",
-                    ),
-                }
+            reason = quality_record.get(
+                "reason",
+                "Previous download failed.",
             )
+            # Premium-restricted videos are not a retryable failure;
+            # surface them separately so the UI/TUI stop offering them.
+            if is_premium_failure(
+                reason
+            ) or is_premium_blocked(record):
+                premium.append(
+                    {
+                        "video_id": video_id,
+                        "track": track,
+                        "reason": reason,
+                    }
+                )
+            else:
+                failed.append(
+                    {
+                        "video_id": video_id,
+                        "track": track,
+                        "reason": reason,
+                    }
+                )
 
         elif status == "skipped":
             skipped.append(
@@ -1908,6 +2530,18 @@ def scan_inventory(
                     "reason": quality_record.get(
                         "reason",
                         "Previous download was skipped.",
+                    ),
+                }
+            )
+
+        elif is_premium_blocked(record):
+            # Liked but never attempted; already known to be premium.
+            premium.append(
+                {
+                    "video_id": video_id,
+                    "track": track,
+                    "reason": (
+                        "Not downloaded at this quality."
                     ),
                 }
             )
@@ -1992,6 +2626,7 @@ def scan_inventory(
         "failed": failed,
         "skipped": skipped,
         "unavailable": unavailable,
+        "premium": premium,
         "liked_total": len(current_map),
         "downloaded_total": len(liked_downloaded),
         "not_downloaded_total": len(not_downloaded),
@@ -2001,6 +2636,7 @@ def scan_inventory(
         ),
         "failed_total": len(failed),
         "skipped_total": len(skipped),
+        "premium_total": len(premium),
         "quality": quality,
     }
 
@@ -2613,6 +3249,14 @@ def unliked_inventory_records(
         ):
             continue
 
+        # Search-added and playlist-synced tracks are kept on disk
+        # even though they are not part of Liked Music.
+        if record.get("source") in {
+            "manual",
+            "playlist",
+        }:
+            continue
+
         files = []
 
         for quality_record in (
@@ -2787,9 +3431,465 @@ def write_backup_snapshot() -> Path:
 
 
 # ============================================================================
-# Download quality
+# Tools: upgrade wizard / premium retry / yt-dlp update
 # ============================================================================
 
+def upgrade_quality_tracks(
+    account: dict[str, Any],
+    target_quality: str,
+) -> list[dict[str, Any]]:
+    """
+    Tracks that were downloaded at some other quality but are not yet
+    available at `target_quality` (and are not premium-blocked). Used
+    by the upgrade-quality wizard to re-download at a higher tier.
+    """
+    inventory = load_inventory(account)
+    records = inventory["tracks"]
+    current = {
+        track["videoId"]: track
+        for track in inventory_current_tracks(account)
+        if track.get("videoId")
+    }
+
+    candidates = []
+
+    for video_id, record in records.items():
+        if is_premium_blocked(record):
+            continue
+
+        qualities = record.get("qualities", {})
+        target = qualities.get(target_quality, {})
+
+        if target.get("status") == "downloaded":
+            continue
+
+        if not any(
+            entry.get("status") == "downloaded"
+            for entry in qualities.values()
+        ):
+            continue
+
+        track = current.get(video_id)
+        if track is None:
+            track = {
+                "videoId": video_id,
+                "title": record.get("title", video_id),
+                "artists": [{"name": record.get("artist", "")}],
+                "album": record.get("album"),
+            }
+
+        candidates.append(track)
+
+    candidates.sort(
+        key=lambda track: track_title(track).lower()
+    )
+
+    return candidates
+
+
+def premium_retry_tracks(
+    account: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Tracks currently marked premium-blocked. Retrying periodically is
+    the only way to discover a track was unlocked (e.g. after a
+    subscription change). Returns tracks with their premium record.
+    """
+    inventory = load_inventory(account)
+    records = inventory["tracks"]
+    current = {
+        track["videoId"]: track
+        for track in inventory_current_tracks(account)
+        if track.get("videoId")
+    }
+
+    retry = []
+
+    for video_id, record in records.items():
+        if not is_premium_blocked(record):
+            continue
+
+        track = current.get(video_id)
+        if track is None:
+            continue
+
+        retry.append(
+            {
+                "video_id": video_id,
+                "title": record.get("title", video_id),
+                "artist": record.get("artist", ""),
+                "album": record.get("album"),
+                "track": track,
+            }
+        )
+
+    return retry
+
+
+def check_yt_dlp_update() -> dict[str, Any]:
+    """
+    Compare the installed yt-dlp with the latest GitHub release.
+    Returns current/latest versions and whether an update is due.
+    """
+    current = "unknown"
+    binary = VENV_BIN / "yt-dlp"
+
+    try:
+        result = subprocess.run(
+            [
+                str(binary),
+                "--version",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            current = (
+                result.stdout.strip()
+                or result.stderr.strip()
+                or "unknown"
+            )
+    except Exception:
+        pass
+
+    latest = current
+
+    try:
+        data = github_json(
+            "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+        )
+        latest = (
+            data.get("tag_name")
+            or data.get("name")
+            or latest
+        ).lstrip("v")
+        current_version = current.lstrip("v")
+        available = bool(
+            latest and current_version and latest != current_version
+        )
+    except Exception:
+        latest = current
+        available = False
+
+    return {
+        "current": current,
+        "latest": latest,
+        "update_available": available,
+        "checked_at": int(time.time()),
+    }
+
+
+def update_yt_dlp() -> dict[str, Any]:
+    """
+    Self-update the venv's yt-dlp binary in place.
+    """
+    binary = VENV_BIN / "yt-dlp"
+
+    try:
+        result = subprocess.run(
+            [
+                str(binary),
+                "--update",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return {
+            "ok": result.returncode == 0,
+            "output": (
+                result.stdout.strip()
+                + "\n"
+                + result.stderr.strip()
+            ).strip(),
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "output": str(error),
+        }
+
+
+def import_spotify_playlist(
+    playlist_url: str,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """
+    Resolve a public Spotify playlist to a list of {title, artist,
+    album} tracks using an anonymously obtained Spotify client token.
+    Each track still needs to be matched to YouTube Music before it
+    can be downloaded (see map_spotify_tracks).
+    """
+    import urllib.error
+
+    playlist_id = None
+
+    match = re.search(
+        r"playlist[/:]([A-Za-z0-9]{10,40})",
+        playlist_url,
+    )
+    if match:
+        playlist_id = match.group(1)
+
+    if not playlist_id:
+        raise ValueError(
+            "Not a Spotify playlist URL (expected open.spotify.com/playlist/…)"
+        )
+
+    def _get_access_token() -> str:
+        request = urllib.request.Request(
+            "https://open.spotify.com/get_access_token",
+            headers={
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        with urllib.request.urlopen(
+            request,
+            timeout=30,
+        ) as response:
+            data = json.loads(
+                response.read().decode("utf-8")
+            )
+        token = data.get(
+            "accessToken"
+        ) or data.get("token")
+        if not token:
+            raise ValueError(
+                "Spotify refused an anonymous token"
+            )
+        return str(token)
+
+    token = _get_access_token()
+
+    def _api(path: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            "https://api.spotify.com/v1/" + path,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        with urllib.request.urlopen(
+            request,
+            timeout=30,
+        ) as response:
+            return json.loads(
+                response.read().decode("utf-8")
+            )
+
+    try:
+        data = _api(
+            f"playlists/{playlist_id}"
+        )
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise ValueError(
+                "Spotify playlist is private or unavailable "
+                "without a Spotify account"
+            )
+        raise ValueError(
+            f"Spotify request failed: {error.code}"
+        )
+
+    title = data.get("name", "Spotify playlist")
+
+    tracks = []
+
+    offset = 0
+    while offset < limit:
+        batch = _api(
+            f"playlists/{playlist_id}/tracks?"
+            f"limit=50&offset={offset}"
+        )
+        for item in batch.get(
+            "items",
+            [],
+        ):
+            entry = item.get("track")
+            if not entry or entry.get("is_local"):
+                continue
+            artists = [
+                artist.get("name", "")
+                for artist in entry.get("artists", [])
+            ]
+            tracks.append(
+                {
+                    "title": entry.get("name", "Unknown"),
+                    "artist": ", ".join(artists),
+                    "album": (
+                        entry.get("album") or {}
+                    ).get("name"),
+                    "duration_ms": entry.get(
+                        "duration_ms",
+                    ),
+                    "spotify_id": entry.get(
+                        "id",
+                    ),
+                }
+            )
+            if len(tracks) >= limit:
+                break
+
+        if len(tracks) >= limit:
+            break
+
+        if not batch.get("next"):
+            break
+
+        offset += 50
+
+    return {
+        "title": title,
+        "tracks": tracks,
+    }
+
+
+def map_spotify_tracks(
+    spotify_tracks: list[dict[str, Any]],
+    account: dict[str, Any] | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """
+    Match Spotify tracks to YouTube Music results so they can be
+    downloaded. Best-match search per track, in batches.
+    """
+    results = []
+
+    for spotify in spotify_tracks[:limit]:
+        query = (
+            f"{spotify.get('title', '')} "
+            f"{spotify.get('artist', '')}"
+        ).strip()
+
+        if not query:
+            continue
+
+        try:
+            matches = search_tracks(
+                query,
+                limit=1,
+                account=account,
+            )
+        except Exception:
+            matches = []
+
+        if not matches:
+            continue
+
+        matched = matches[0]
+
+        results.append(
+            {
+                "videoId": matched.get("videoId"),
+                "title": track_title(matched),
+                "artists": (
+                    matched.get("artists")
+                    or [
+                        {
+                            "name": spotify.get(
+                                "artist",
+                                "Unknown",
+                            )
+                        }
+                    ]
+                ),
+                "album": get_album(matched),
+                "matched_title": matched.get(
+                    "title",
+                    "",
+                ),
+            }
+        )
+
+    return results
+
+
+# ============================================================================
+# Within-account duplicates
+# ============================================================================
+
+def within_account_duplicates(
+    account: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Group an account's inventory by normalized title+artist and report
+    groups that contain more than one video id. Useful for catching
+    re-releases, covers and remasters in the same library.
+    """
+    inventory = load_inventory(account)
+    records = inventory["tracks"]
+
+    groups: dict[
+        tuple[str, str],
+        list[dict[str, Any]],
+    ] = {}
+
+    for video_id, record in records.items():
+        if is_premium_blocked(record):
+            continue
+
+        if not any(
+            entry.get("status") == "downloaded"
+            for entry in (
+                record.get("qualities") or {}
+            ).values()
+        ):
+            continue
+
+        key = _normalized_title_artist(
+            record.get("title"),
+            record.get("artist"),
+        )
+
+        groups.setdefault(
+            key,
+            [],
+        ).append(
+            {
+                "video_id": video_id,
+                "title": record.get("title", "Unknown"),
+                "artist": record.get("artist", "Unknown"),
+                "album": record.get("album"),
+                "qualities": sorted(
+                    (
+                        quality
+                        for quality, entry in (
+                            record.get("qualities") or {}
+                        ).items()
+                        if entry.get("status") == "downloaded"
+                    ),
+                    key=lambda quality: (
+                        QUALITY_OPTIONS_INDEX.get(
+                            quality,
+                            99,
+                        )
+                    ),
+                ),
+            }
+        )
+
+    return [
+        {
+            "title": entries[0]["title"],
+            "artist": entries[0]["artist"],
+            "tracks": entries,
+            "count": len(entries),
+        }
+        for entries in groups.values()
+        if len(entries) > 1
+    ]
+
+
+QUALITY_OPTIONS_INDEX = {
+    quality: index
+    for index, (_label, quality) in enumerate(QUALITY_OPTIONS)
+}
+
+
+# ============================================================================
+# Download quality
+# ============================================================================
 def quality_config(
     quality: str,
 ) -> dict[str, Any]:
@@ -2865,6 +3965,43 @@ class DownloadSession:
     session: str = "loop"
 
 
+PREMIUM_BLOCK_REASON = "premium"
+
+
+def is_premium_failure(reason: str) -> bool:
+    """True when a yt-dlp failure means the video is behind the YouTube
+    Music Premium wall (not just a transient error)."""
+    return "premium" in (reason or "").lower()
+
+
+def is_premium_blocked(record: dict[str, Any]) -> bool:
+    """True when a track record is known to be behind the YouTube
+    Music Premium wall: either an explicit block or any failed
+    attempt whose reason mentions premium (covers records written
+    before blocks existed)."""
+    blocked = record.get("blocked") or {}
+    if blocked.get("reason") == PREMIUM_BLOCK_REASON:
+        return True
+    for entry in (record.get("qualities") or {}).values():
+        if entry.get("status") == "failed" and is_premium_failure(
+            entry.get("reason")
+        ):
+            return True
+    return False
+
+
+def file_sha256(path: Path, chunk_size: int = 1 << 20) -> str:
+    """SHA-256 hex digest of a file, streamed in chunks."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class DownloadWorker:
     def __init__(
         self,
@@ -2874,6 +4011,7 @@ class DownloadWorker:
         settings: dict[str, Any],
         callback,
         output_dir: Path | None = None,
+        source: str = "library",
     ):
         self.account = account
         self.tracks = tracks
@@ -2881,9 +4019,14 @@ class DownloadWorker:
         self.settings = settings
         self.callback = callback
         self.output_dir = output_dir
+        self.source = source
 
         self.cancelled = False
         self._stop = False
+
+        # Guards shared counters/inventory writes when a stage runs
+        # multiple downloads concurrently (max_parallel_downloads > 1).
+        self._io_lock = threading.Lock()
 
         self.active_quality = None
         self.active_track_no = 0
@@ -2915,12 +4058,17 @@ class DownloadWorker:
         )
 
     def counts(self) -> None:
+        with self._io_lock:
+            downloaded = self.downloaded
+            skipped = self.skipped
+            failed = self.failed
+            unavailable = self.unavailable
         self.emit(
             "counts",
-            downloaded=self.downloaded,
-            skipped=self.skipped,
-            failed=self.failed,
-            unavailable=self.unavailable,
+            downloaded=downloaded,
+            skipped=skipped,
+            failed=failed,
+            unavailable=unavailable,
         )
 
     def write_result(
@@ -2932,45 +4080,60 @@ class DownloadWorker:
         status: str,
         reason: str,
         file: str | None = None,
-    ) -> None:
-        records = inventory["tracks"]
+        sha256: str | None = None,
+    ) -> dict[str, Any]:
+        with self._io_lock:
+            records = inventory["tracks"]
 
-        record = records.setdefault(
-            video_id,
-            {
-                "video_id": video_id,
-                "qualities": {},
-            },
-        )
+            record = records.setdefault(
+                video_id,
+                {
+                    "video_id": video_id,
+                    "qualities": {},
+                },
+            )
 
-        record["title"] = track_title(track)
-        record["artist"] = get_artist(track)
-        record["album"] = get_album(track)
+            record["title"] = track_title(track)
+            record["artist"] = get_artist(track)
+            record["album"] = get_album(track)
 
-        qualities = record.setdefault(
-            "qualities",
-            {},
-        )
+            # A successful or skipped download proves the video is no
+            # longer behind the premium wall; clear any prior block.
+            if status in ("downloaded", "skipped"):
+                record.pop("blocked", None)
 
-        qualities[quality] = {
-            "status": status,
-            "reason": reason,
-            "file": file,
-            "updated_at": int(time.time()),
-        }
+            qualities = record.setdefault(
+                "qualities",
+                {},
+            )
 
-        self.results.append(
-            {
-                "timestamp": int(time.time()),
-                "video_id": video_id,
-                "title": track_title(track),
-                "artist": get_artist(track),
-                "quality": quality,
+            qualities[quality] = {
                 "status": status,
                 "reason": reason,
                 "file": file,
+                "sha256": sha256,
+                "size_bytes": (
+                    int(Path(file).stat().st_size)
+                    if sha256 and file and Path(file).exists()
+                    else None
+                ),
+                "updated_at": int(time.time()),
             }
-        )
+
+            self.results.append(
+                {
+                    "timestamp": int(time.time()),
+                    "video_id": video_id,
+                    "title": track_title(track),
+                    "artist": get_artist(track),
+                    "quality": quality,
+                    "status": status,
+                    "reason": reason,
+                    "file": file,
+                }
+            )
+
+            return record
 
     def run(self) -> None:
         try:
@@ -3070,16 +4233,18 @@ class DownloadWorker:
         inventory = update_inventory_from_library(
             self.account,
             self.tracks,
+            mark_liked=(self.source == "library"),
+            source=self.source,
         )
 
         total = len(self.tracks)
 
-        for number, track in enumerate(
-            self.tracks,
-            1,
-        ):
+        def download_one(
+            number: int,
+            track: dict[str, Any],
+        ) -> None:
             if self.cancelled:
-                break
+                return
 
             video_id = track.get("videoId")
             title = track_title(track)
@@ -3103,7 +4268,8 @@ class DownloadWorker:
                     "it is unavailable for downloading."
                 )
 
-                self.unavailable += 1
+                with self._io_lock:
+                    self.unavailable += 1
 
                 self.write_result(
                     inventory,
@@ -3120,7 +4286,7 @@ class DownloadWorker:
                 )
 
                 self.counts()
-                continue
+                return
 
             existing = find_existing_quality_file(
                 track,
@@ -3143,7 +4309,8 @@ class DownloadWorker:
                         f"({quality_label(quality)})."
                     )
 
-                    self.skipped += 1
+                    with self._io_lock:
+                        self.skipped += 1
 
                     self.write_result(
                         inventory,
@@ -3166,7 +4333,7 @@ class DownloadWorker:
                     )
 
                     self.counts()
-                    continue
+                    return
 
                 # Replace mode.
                 try:
@@ -3177,7 +4344,8 @@ class DownloadWorker:
                         f"{error}"
                     )
 
-                    self.failed += 1
+                    with self._io_lock:
+                        self.failed += 1
 
                     self.write_result(
                         inventory,
@@ -3195,7 +4363,7 @@ class DownloadWorker:
                     )
 
                     self.counts()
-                    continue
+                    return
 
             # Clean old temporary files.
             for temporary in output.glob(
@@ -3272,6 +4440,20 @@ class DownloadWorker:
                     [
                         "--audio-quality",
                         config["audio_quality"],
+                    ]
+                )
+
+            rate_limit = str(
+                self.settings.get(
+                    "download_rate_limit",
+                    "",
+                )
+            ).strip()
+            if rate_limit:
+                command.extend(
+                    [
+                        "--limit-rate",
+                        rate_limit,
                     ]
                 )
 
@@ -3390,7 +4572,7 @@ class DownloadWorker:
                     )
 
             if self.cancelled:
-                break
+                return
 
             # Find output.
             extension = config["extension"]
@@ -3423,9 +4605,10 @@ class DownloadWorker:
                     )
                 )
 
-                self.failed += 1
+                with self._io_lock:
+                    self.failed += 1
 
-                self.write_result(
+                record = self.write_result(
                     inventory,
                     video_id,
                     track,
@@ -3434,10 +4617,27 @@ class DownloadWorker:
                     reason,
                 )
 
-                self.emit(
-                    "status",
-                    text=f"✗ FAILED — {reason}",
-                )
+                # A premium-restricted video cannot be fetched with the
+                # current account; remember that so the UI stops offering
+                # to download it and future syncs don't hammer it.
+                if is_premium_failure(reason):
+                    with self._io_lock:
+                        record["blocked"] = {
+                            "reason": PREMIUM_BLOCK_REASON,
+                            "blocked_at": int(time.time()),
+                        }
+                    self.emit(
+                        "status",
+                        text=(
+                            "✗ PREMIUM — This track needs YouTube "
+                            "Music Premium and cannot be downloaded."
+                        ),
+                    )
+                else:
+                    self.emit(
+                        "status",
+                        text=f"✗ FAILED — {reason}",
+                    )
 
                 for temporary in output.glob(
                     f".ytm_{video_id}*"
@@ -3447,7 +4647,7 @@ class DownloadWorker:
                     )
 
                 self.counts()
-                continue
+                return
 
             downloaded = candidates[0]
 
@@ -3477,7 +4677,8 @@ class DownloadWorker:
                     f"into the library: {error}"
                 )
 
-                self.failed += 1
+                with self._io_lock:
+                    self.failed += 1
 
                 self.write_result(
                     inventory,
@@ -3494,10 +4695,16 @@ class DownloadWorker:
                 )
 
                 self.counts()
-                continue
+                return
 
             # Record a verified download.
-            self.downloaded += 1
+            with self._io_lock:
+                self.downloaded += 1
+
+            try:
+                file_hash = file_sha256(destination)
+            except Exception:
+                file_hash = None
 
             self.write_result(
                 inventory,
@@ -3510,6 +4717,7 @@ class DownloadWorker:
                     f"{quality_label(quality)}."
                 ),
                 str(destination),
+                sha256=file_hash,
             )
 
             self.emit(
@@ -3527,10 +4735,63 @@ class DownloadWorker:
 
             self.counts()
 
-            save_inventory(
-                self.account,
-                inventory,
-            )
+            with self._io_lock:
+                save_inventory(
+                    self.account,
+                    inventory,
+                )
+
+        max_parallel = max(
+            1,
+            int(
+                self.settings.get(
+                    "max_parallel_downloads",
+                    1,
+                ) or 1
+            ),
+        )
+
+        if max_parallel <= 1:
+            for number, track in enumerate(
+                self.tracks,
+                1,
+            ):
+                if self.cancelled:
+                    break
+                download_one(
+                    number,
+                    track,
+                )
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(
+                max_workers=max_parallel,
+            ) as pool:
+                pending = []
+
+                for number, track in enumerate(
+                    self.tracks,
+                    1,
+                ):
+                    if self.cancelled:
+                        break
+                    pending.append(
+                        pool.submit(
+                            download_one,
+                            number,
+                            track,
+                        )
+                    )
+
+                for future in pending:
+                    try:
+                        future.result()
+                    except Exception as error:
+                        self.emit(
+                            "log",
+                            text=f"Download error: {error}",
+                        )
 
         save_inventory(
             self.account,
@@ -4701,7 +5962,8 @@ class LibraryStatusScreen(ModalScreen):
             f"Downloaded but no longer liked: "
             f"{r['no_longer_liked_total']}\n"
             f"Previously failed: {r['failed_total']}\n"
-            f"Previously skipped: {r['skipped_total']}"
+            f"Previously skipped: {r['skipped_total']}\n"
+            f"Premium-locked: {r['premium_total']}"
         )
 
         lines = []
@@ -4785,6 +6047,21 @@ class LibraryStatusScreen(ModalScreen):
                     f"{track_title(item['track'])}"
                 ),
                 f"    Reason: {item['reason']}",
+            ],
+        )
+
+        add_section(
+            "PREMIUM-LOCKED",
+            r["premium"],
+            lambda item: [
+                (
+                    f"  • {get_artist(item['track'])} — "
+                    f"{track_title(item['track'])}"
+                ),
+                (
+                    "    Reason: requires YouTube Music "
+                    "Premium to download."
+                ),
             ],
         )
 

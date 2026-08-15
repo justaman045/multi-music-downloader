@@ -199,6 +199,240 @@ def test_settings_roundtrip_via_api(server, app):
     assert app.load_settings()["default_quality"] == "mp3_192"
 
 
+def test_settings_rate_limit_via_api(server, app):
+    _srv, port = server
+    status, _headers, data = request(
+        port,
+        "POST",
+        "/api/settings",
+        body=json.dumps({"download_rate_limit": "500K"}),
+    )
+    assert status == 200
+    assert json.loads(data)["download_rate_limit"] == "500K"
+    assert app.load_settings()["download_rate_limit"] == "500K"
+
+    status, _headers, _data = request(
+        port,
+        "POST",
+        "/api/settings",
+        body=json.dumps({"download_rate_limit": "!!bogus!!"}),
+    )
+    assert status == 400
+
+
+def test_playlist_export_csv(server, app, tmp_path):
+    _srv, port = server
+    import web.playlists
+
+    playlist = web.playlists.create_playlist(
+        app,
+        "Test CSV",
+        kind="custom",
+        account="test_acct",
+    )
+    web.playlists.add_tracks(
+        app,
+        playlist["id"],
+        [
+            {
+                "account": "test_acct",
+                "video_id": "AbC123xyz_9",
+                "title": "Song",
+                "artist": "Artist",
+                "album": "LP",
+            }
+        ],
+    )
+    playlist = web.playlists.get_playlist(app, playlist["id"])
+    path = web.playlists.export_playlist(app, playlist, "csv")
+    assert path.exists()
+    text = path.read_text(encoding="utf-8")
+    assert "video_id,account,title,artist,album" in text
+    assert "AbC123xyz_9" in text
+    assert "Song" in text
+
+    status, _headers, data = request(
+        port,
+        "POST",
+        f"/api/playlists/{playlist['id']}/export",
+        body=json.dumps({"format": "csv"}),
+    )
+    assert status == 200
+    assert Path(json.loads(data)["file"]).exists()
+
+
+def test_history_endpoint(server, app, tmp_path):
+    _srv, port = server
+    from web import plays
+
+    now = int(__import__("time").time())
+    data = {
+        "version": 1,
+        "plays": {
+            "AbC123xyz_9": {
+                "video_id": "AbC123xyz_9",
+                "count": 3,
+                "first_played": now - 86400,
+                "last_played": now,
+            }
+        },
+        "recent": [
+            {"video_id": "AbC123xyz_9", "ts": now - 2 * 86400, "progress": 90.0},
+            {"video_id": "AbC123xyz_9", "ts": now - 3600, "progress": 80.0},
+        ],
+        "updated_at": now,
+    }
+    path = plays.plays_path(app, "test_acct")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    status, _headers, body = request(port, "GET", "/api/history?days=30")
+    assert status == 200
+    history = json.loads(body)
+    assert history["total_plays"] == 2
+    assert len(history["per_day"]) == 2
+    assert history["top_tracks"][0]["id"] == "AbC123xyz_9"
+
+
+def test_play_records_and_broadcasts_sse_event(server):
+    """POSTing a play must persist it and broadcast a play_recorded event
+    on the event bus so connected SPA clients can live-update."""
+    srv, port = server
+    queue_ = srv.web.bus.subscribe()
+    try:
+        status, _headers, body = request(
+            port,
+            "POST",
+            "/api/plays",
+            body=json.dumps(
+                {"slug": "test_acct", "video_id": "AbC123xyz_9", "progress": 75}
+            ),
+        )
+        assert status == 200
+        result = json.loads(body)
+        assert result["counted"] is True
+        assert result["total"] == 1
+
+        payload = queue_.get(timeout=5)
+        event = json.loads(payload[len("data: ") :])
+        assert event["type"] == "play_recorded"
+        assert event["slug"] == "test_acct"
+        assert event["video_id"] == "AbC123xyz_9"
+        assert event["counted"] is True
+        assert event["total"] == 1
+    finally:
+        srv.web.bus.unsubscribe(queue_)
+
+
+
+def test_verify_endpoint_ok(server, app):
+    _srv, port = server
+    status, _headers, body = request(
+        port,
+        "POST",
+        "/api/verify",
+        body=json.dumps({"slug": "test_acct"}),
+    )
+    assert status == 200
+    report = json.loads(body)
+    assert report["summary"]["ok"] == 1
+    assert report["results"]["AbC123xyz_9"]["status"] == "ok"
+
+
+def test_verify_endpoint_missing(server, app):
+    _srv, port = server
+    import shutil
+
+    account = app.get_accounts()[0]
+    for quality_dir in account["output"].iterdir():
+        if quality_dir.is_dir():
+            shutil.rmtree(quality_dir)
+
+    status, _headers, body = request(
+        port,
+        "POST",
+        "/api/verify",
+        body=json.dumps({"slug": "test_acct"}),
+    )
+    assert status == 200
+    report = json.loads(body)
+    assert report["summary"]["missing"] == 1
+    assert report["results"]["AbC123xyz_9"]["status"] == "missing"
+
+
+def test_search_anonymous_fallback(server, app, monkeypatch):
+    """Without accounts= the search falls back to a plain (anonymous)
+    results list so the SPA's simple path keeps working."""
+    _srv, port = server
+
+    def fake_search(query, limit=10, account=None):
+        assert account is None
+        return [
+            {
+                "videoId": "xyz9876abc",
+                "title": "Anon Song",
+                "artists": [{"name": "Anon Artist"}],
+            }
+        ]
+
+    monkeypatch.setattr(app, "search_tracks", fake_search)
+    status, _headers, body = request(port, "GET", "/api/search?q=song")
+    assert status == 200
+    payload = json.loads(body)
+    assert isinstance(payload, list)
+    assert payload[0]["videoId"] == "xyz9876abc"
+
+
+def test_search_requires_query(server):
+    _srv, port = server
+    status, _headers, _body = request(port, "GET", "/api/search?q=")
+    assert status == 400
+
+
+def test_search_multi_account(server, app, monkeypatch):
+    """accounts= runs an authenticated search per account and annotates
+    results with which accounts can stream them (deduped by videoId)."""
+    _srv, port = server
+
+    def fake_search(query, limit=10, account=None):
+        if account and account["slug"] == "test_acct":
+            return [
+                {
+                    "videoId": "abc123def45",
+                    "title": "Found Song",
+                    "artists": [{"name": "Found Artist"}],
+                    "album": {"name": "LP"},
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(app, "search_tracks", fake_search)
+
+    status, _headers, body = request(
+        port,
+        "GET",
+        "/api/search?q=found&limit=8&accounts=test_acct",
+    )
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["accounts"] == ["test_acct"]
+    assert len(payload["results"]) == 1
+    result = payload["results"][0]
+    assert result["videoId"] == "abc123def45"
+    assert result["accounts"] == ["test_acct"]
+    assert result["owned_by"] == []
+
+
+def test_search_multi_account_unknown(server):
+    _srv, port = server
+    status, _headers, _body = request(
+        port,
+        "GET",
+        "/api/search?q=found&accounts=nope",
+    )
+    assert status == 404
+
+
 def test_duplicates_export(server, app):
     _srv, port = server
     status, _headers, data = request(

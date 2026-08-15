@@ -125,6 +125,8 @@ def test_quality_options(app):
 def test_default_settings(app):
     assert app.DEFAULT_SETTINGS["default_quality"] == "best"
     assert app.DEFAULT_SETTINGS["default_existing_policy"] == "skip"
+    assert "download_rate_limit" in app.DEFAULT_SETTINGS
+    assert app.DEFAULT_SETTINGS["download_rate_limit"] == ""
 
 
 def test_settings_roundtrip(app, isolated_paths):
@@ -134,6 +136,11 @@ def test_settings_roundtrip(app, isolated_paths):
     # Missing keys fall back to defaults.
     assert loaded["default_existing_policy"] == "skip"
     assert loaded["retry_attempts"] == 3
+
+
+def test_settings_rate_limit_roundtrip(app, isolated_paths):
+    app.save_settings({"download_rate_limit": "1M"})
+    assert app.load_settings()["download_rate_limit"] == "1M"
 
 
 def test_settings_corrupt_falls_back_to_defaults(app, isolated_paths):
@@ -258,6 +265,136 @@ def test_inventory_corrupt_returns_empty(app, isolated_paths):
     app.inventory_file(account).write_text("[", encoding="utf-8")
     inventory = app.load_inventory(account)
     assert inventory == {"version": 2, "tracks": {}}
+
+
+# ---------------------------------------------------------------------------
+# File integrity verification
+# ---------------------------------------------------------------------------
+
+def test_file_sha256_digest(app, isolated_paths):
+    path = isolated_paths.project / "sample.bin"
+    path.write_bytes(b"hello world")
+    digest = app.file_sha256(path)
+    assert digest == "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+
+
+def test_verify_account_files_ok_missing_corrupt(app, isolated_paths):
+    base = isolated_paths.project
+    account = make_account(app, "a1", base)
+
+    ok_file = base / "files" / "a1" / "ok.mp3"
+    ok_file.parent.mkdir(parents=True, exist_ok=True)
+    ok_file.write_bytes(b"audio data")
+
+    corrupt_file = base / "files" / "a1" / "corrupt.mp3"
+    corrupt_file.write_bytes(b"original content")
+
+    inventory = {
+        "version": 2,
+        "tracks": {
+            "ok_vid": {
+                "video_id": "ok_vid",
+                "qualities": {
+                    "mp3_320": {
+                        "status": "downloaded",
+                        "reason": None,
+                        "file": str(ok_file),
+                        "sha256": app.file_sha256(ok_file),
+                        "size_bytes": ok_file.stat().st_size,
+                    },
+                },
+                "title": "OK",
+                "artist": "Artist",
+                "album": "LP",
+                "last_seen_liked": 1,
+                "currently_liked": True,
+            },
+            "corrupt_vid": {
+                "video_id": "corrupt_vid",
+                "qualities": {
+                    "mp3_320": {
+                        "status": "downloaded",
+                        "reason": None,
+                        "file": str(corrupt_file),
+                        "sha256": app.file_sha256(corrupt_file),
+                        "size_bytes": corrupt_file.stat().st_size,
+                    },
+                },
+                "title": "Bad",
+                "artist": "Artist",
+                "album": "LP",
+                "last_seen_liked": 1,
+                "currently_liked": True,
+            },
+            "missing_vid": {
+                "video_id": "missing_vid",
+                "qualities": {
+                    "mp3_320": {
+                        "status": "downloaded",
+                        "reason": None,
+                        "file": str(base / "files" / "a1" / "gone.mp3"),
+                        "sha256": "deadbeef",
+                    },
+                },
+                "title": "Gone",
+                "artist": "Artist",
+                "album": "LP",
+                "last_seen_liked": 1,
+                "currently_liked": True,
+            },
+        },
+    }
+    write_inventory(account, inventory)
+
+    # Tamper with the "corrupt" file after hashing.
+    corrupt_file.write_bytes(b"tampered content")
+
+    report = app.verify_account_files(account)
+    results = report["results"]
+
+    assert results["ok_vid"]["status"] == "ok"
+    assert results["corrupt_vid"]["status"] == "corrupt"
+    assert results["missing_vid"]["status"] == "missing"
+    assert report["summary"]["ok"] == 1
+    assert report["summary"]["corrupt"] == 1
+    assert report["summary"]["missing"] == 1
+
+
+def test_verify_account_files_no_sha256_falls_back_to_size(app, isolated_paths):
+    """Tracks downloaded before hashing was introduced are verified by
+    existence/size alone and must still report ok."""
+    base = isolated_paths.project
+    account = make_account(app, "a1", base)
+
+    legacy_file = base / "files" / "a1" / "legacy.mp3"
+    legacy_file.parent.mkdir(parents=True, exist_ok=True)
+    legacy_file.write_bytes(b"data")
+
+    inventory = {
+        "version": 2,
+        "tracks": {
+            "legacy_vid": {
+                "video_id": "legacy_vid",
+                "qualities": {
+                    "mp3_320": {
+                        "status": "downloaded",
+                        "reason": None,
+                        "file": str(legacy_file),
+                    },
+                },
+                "title": "Legacy",
+                "artist": "Artist",
+                "album": "LP",
+                "last_seen_liked": 1,
+                "currently_liked": True,
+            },
+        },
+    }
+    write_inventory(account, inventory)
+
+    report = app.verify_account_files(account)
+    assert report["results"]["legacy_vid"]["status"] == "ok"
+    assert report["summary"]["ok"] == 1
 
 
 def test_build_sessions_skip_expands(app):

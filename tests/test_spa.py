@@ -98,6 +98,24 @@ def extract_function(src: str, name: str) -> str:
     return match.group("body")
 
 
+def extract_function_balanced(src: str, name: str) -> str:
+    """Extract a function body honoring nested braces, unlike the naive
+    extract_function() which stops at the first standalone '}'."""
+    match = re.search(rf"function {name}\(\) \{{", src)
+    assert match, f"{name}() not found in app.js"
+    start = match.end()
+    depth = 1
+    i = start
+    while i < len(src) and depth:
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+        i += 1
+    assert depth == 0, f"{name}() braces unbalanced"
+    return src[start : i - 1]
+
+
 def test_spa_download_ui_gated_on_needs_download():
     """Download affordances must only appear for online-only tracks.
 
@@ -142,3 +160,122 @@ def test_spa_auto_download_helpers():
             rf"(?:async )?function {helper}\(",
             src,
         ), f"{helper}() not defined in app.js"
+
+
+def test_spa_rate_limit_setting_ui():
+    """The rate-limit setting must be present in the Settings form and
+    included in the save payload."""
+    src = read_spa()
+    assert 'id="set-rate-limit"' in src, "rate-limit input missing from Settings"
+    assert "download_rate_limit:" in src, "rate-limit key missing from settings save payload"
+
+
+def test_spa_verify_files_ui():
+    """The Status page must offer file verification and the dialog must
+    POST to /api/verify."""
+    src = read_spa()
+    assert "Verify files" in src, "verify button missing from Status page"
+    assert '"/api/verify"' in src, "verify dialog must POST to /api/verify"
+
+
+def test_spa_history_charts_ui():
+    """The Stats page must fetch per-period history and render it."""
+    src = read_spa()
+    assert "/api/history?days=" in src, "history fetch missing from Stats page"
+    assert "hist-range" in src, "history range selector missing"
+
+
+def test_spa_multi_account_search():
+    """YTM search must send the account list and annotate ownership."""
+    src = read_spa()
+    assert "accountsParam" in src, "search must send the accounts parameter"
+    assert "owned_by" in src, "search results must annotate owned_by accounts"
+
+
+def test_spa_bind_track_table_null_safe():
+    """Regression: bindTrackTable() must tolerate containers without a
+    tracks table (e.g. the Stats page, which renders stat cards only).
+    Before the fix, unguarded $$('.row-dl', table) / $$('.row-pl', table)
+    called null.querySelectorAll and crashed renderStats()."""
+    src = read_spa()
+    assert 'if (table) $$(".row-dl", table)' in src, ".row-dl binding must be guarded by table existence"
+    assert 'if (table) $$(".row-pl", table)' in src, ".row-pl binding must be guarded by table existence"
+
+
+def test_spa_play_report_live_updates_library():
+    """reportPlay() must update state.library plays from the server response
+    and re-render the aggregate views so counts appear without a reload."""
+    src = read_spa()
+    assert 'hit.plays = res.total' in src, "reportPlay() must write the server's total back into state.library"
+    assert '["home", "stats"].includes(state.route)' in src, "reportPlay() must re-render home/stats after a recorded play"
+
+
+def test_spa_play_recorded_sse_handler():
+    """The SPA must handle the play_recorded SSE event by updating the
+    library snapshot and re-rendering the active stats/home view."""
+    src = read_spa()
+    assert 'data.type === "play_recorded"' in src, "play_recorded SSE event handler missing"
+    assert 'hit.plays = data.total' in src, "play_recorded handler must write the server total into state.library"
+
+
+def test_spa_play_recorded_route_rerender():
+    """The play_recorded handler must re-render the stats/home page when it
+    is the active route (so an already-open Stats page updates live)."""
+    src = read_spa()
+    assert 'state.route === "stats" || state.route === "home"' in src, "play_recorded handler must re-render stats/home"
+
+
+def test_spa_player_persist_helpers_exist():
+    """The player snapshot helpers must exist so the last played queue can
+    survive a page refresh / server restart."""
+    src = read_spa()
+    assert "function persistPlayer()" in src, "persistPlayer() not defined in app.js"
+    assert "function restorePlayer()" in src, "restorePlayer() not defined in app.js"
+    assert '"ls-player"' in src, "ls-player localStorage key must be used"
+
+
+def test_spa_player_persists_identities_not_urls():
+    """The persisted snapshot must store track identities, not token-baked
+    stream/art URLs, so URLs can be re-derived from the fresh library."""
+    src = read_spa()
+    body = extract_function(src, "persistPlayer")
+    assert "queue: state.player.queue.map((t) => ({ id: t.id, account: t.account }))" in body, (
+        "persistPlayer() must store id/account identities only"
+    )
+    assert "index: state.player.index" in body
+    assert "shuffle: state.player.shuffle" in body
+    assert "repeat: state.player.repeat" in body
+
+
+def test_spa_player_restore_resolves_from_library():
+    """restorePlayer() must map persisted identities to fresh library tracks
+    (with stream URLs) and rebuild the player without autoplaying."""
+    src = read_spa()
+    body = extract_function_balanced(src, "restorePlayer")
+    assert "t.stream" in body, "restorePlayer() must only keep tracks that still have a stream"
+    assert "state.player.queue = queue" in body
+    assert "state.player.index = index" in body
+    assert "audio.src = streamUrl(track)" in body
+    assert "updatePlayerUI()" in body
+    assert "audio.play()" not in body, "restorePlayer() must not autoplay"
+
+
+def test_spa_player_restore_called_after_library_load():
+    """init() must restore the player only after loadLibrary() so art/stream
+    URLs carry the current token."""
+    body = extract_function(read_spa(), "init")
+    assert "restorePlayer();" in body, "init() must call restorePlayer()"
+    assert body.index("await loadLibrary();") < body.index("restorePlayer();"), (
+        "restorePlayer() must run after loadLibrary()"
+    )
+
+
+def test_spa_stop_playback_clears_snapshot():
+    """stopPlayback() must clear the ls-player snapshot so a deliberate stop
+    is not resurrected on the next refresh."""
+    src = read_spa()
+    body = extract_function(src, "stopPlayback")
+    assert 'localStorage.removeItem("ls-player")' in body, (
+        "stopPlayback() must clear the ls-player snapshot"
+    )
+
