@@ -56,7 +56,9 @@ jobs:
 
       - name: Secret scan (tracked files must not contain credentials)
         run: |
-          matches=$(git grep -I -E -l 'SAPISID|SIDCC|__Secure-|PASTE YOUR' -- . 2>/dev/null || true)
+          # Exclude this workflow itself: it contains the literal patterns
+          # below, which would otherwise make the scan self-match.
+          matches=$(git grep -I -E -l 'SAPISID|SIDCC|__Secure-|PASTE YOUR' -- . ':(exclude).github/workflows/ci.yml' 2>/dev/null || true)
           if [ -n "$matches" ]; then
             echo "FAIL: credential patterns found in tracked files:" >&2
             echo "$matches" >&2
