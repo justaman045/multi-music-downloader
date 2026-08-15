@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Self-contained multi-account YouTube Music liked-music downloader. The entire
-application is a single script, `ytm-ll-dl-modern.py` (~8900 lines) at the repo
+application is a single script, `ytm-ll-dl-modern.py` (~9100 lines) at the repo
 root, plus `install.sh`/`run.sh`, `requirements.txt`, `README.md`, and the
 `web/` package (a self-hosted local player UI). Tests live in `tests/` (pytest,
 run by CI). There is **no linter, formatter, or type checker**; verify changes
@@ -15,7 +15,7 @@ with pytest, `node --check` for JS, and a manual run.
   can load.
 - `web/server.py` is a plain `ThreadingHTTPServer` handler (no framework).
   Route dispatch is a linear chain of `if head == ...` blocks in
-  `_api_get`/`_api_post` (server.py:233, :811) — **order matters**. In
+  `_api_get`/`_api_post` (server.py:233, :909) — **order matters**. In
   particular `head == "duplicates"` must match `len(parts) == 1`, otherwise it
   swallows `duplicates/within` (server.py:294). New routes get matched only if
   added before the trailing `404`; mirror an existing entry's
@@ -33,15 +33,18 @@ with pytest, `node --check` for JS, and a manual run.
   `/api/upgrade-preview/<slug>?quality=` (list of tracks eligible for
   re-download at a higher quality), `/api/yt-dlp-update`, `/api/auth-health`,
   `/api/backup` (POST), `/api/backups` (list), `/api/backups/prune` (POST),
-  `/api/search?q=`, `/api/stats`, `/api/lastfm`,
-  `/api/lastfm/flush` (POST), `/api/plays` (POST), `/api/tags` (POST),
-  `/api/scheduler` (status), `/api/scheduler/<task>` (POST run-now, e.g.
-  `premium_retry`), `/api/playlists` + `/api/playlists/<id>/add|remove|
-  update|export` (POST), `/api/playlists/<id>` (DELETE), `/api/events` (SSE
-  stream), `/api/art/<slug>/<video_id>.jpg` (disk-cached in
-  `files/<slug>/.art_cache/`), and `/api/media/<slug>/<video_id>/stream`
-  (Range-served audio; FLAC/WAV/AIFF transcoded to Opus via ffmpeg when
-  `?format=opus`; `?download=1` forces an attachment).
+  `/api/search?q=`, `/api/stats`, `/api/history?days=` (per-account play
+  history, `plays.history_stats`, server.py:430), `/api/verify` (POST,
+  per-account file verification, `_verify_files`, server.py:1448),
+  `/api/lastfm`, `/api/lastfm/flush` (POST), `/api/plays` (POST),
+  `/api/tags` (POST), `/api/scheduler` (status), `/api/scheduler/<task>`
+  (POST run-now, e.g. `premium_retry`), `/api/playlists` +
+  `/api/playlists/<id>/add|remove|update|export` (POST), `/api/playlists/<id>`
+  (DELETE), `/api/events` (SSE stream), `/api/art/<slug>/<video_id>.jpg`
+  (disk-cached in `files/<slug>/.art_cache/`), and
+  `/api/media/<slug>/<video_id>/stream` (Range-served audio; FLAC/WAV/AIFF
+  transcoded to Opus via ffmpeg when `?format=opus`; `?download=1` forces an
+  attachment).
 - `web/downloads.py` runs the same `DownloadWorker` the TUI uses, routing its
   events into a shared `EventBus` (`web/bus.py`) consumed via SSE. Session
   snapshots live in `DownloadManager`; a session ends with
@@ -70,6 +73,21 @@ with pytest, `node --check` for JS, and a manual run.
   `localStorage` (`ls-token`), sends `Authorization: Bearer`, prompts on the
   first 401, and appends `?token=` to art/stream URLs (`withToken()` in
   app.js).
+- **Player state persistence** — `persistPlayer()`/`restorePlayer()`
+  (app.js:380-438) snapshot the queue to `localStorage["ls-player"]` as
+  **identities only** (`{id, account}`), never token-baked URLs. `restorePlayer()`
+  runs in `init()` **after** `loadLibrary()` so art/stream URLs carry the
+  current token, never autoplays, drops tracks absent from the fresh library,
+  and restores shuffle/repeat. `stopPlayback()` clears the snapshot, so a
+  deliberate stop is not resurrected on the next refresh.
+- **Live play reporting** — `reportPlay()` fires when playback passes 60%
+  (app.js:560), POSTs `/api/plays`; the server dedupes a 90s window
+  (plays.py:25-26) and broadcasts a `play_recorded` SSE event (server.py:1296).
+  The SPA writes the server's authoritative total back into `state.library`
+  (`hit.plays = res.total`) and re-renders the stats/home view. Root cause of
+  the "stats showing 0" bug: client aggregates read a one-time
+  `state.library`/`/api/stats` snapshot — the server is authoritative, so any
+  new counter must be echoed back into client state (POST response or SSE).
 
 ## Running
 
@@ -91,6 +109,15 @@ with pytest, `node --check` for JS, and a manual run.
   and drives HTTP flows (settings roundtrip, media streaming, token gate).
   CI (`.github/workflows/ci.yml`) runs this plus compile, help/version, the
   venv guard, and a secret scan for cookie patterns.
+- **CI secret scan self-match**: the secret scan greps for the literal patterns
+  `SAPISID|SIDCC|__Secure-|PASTE YOUR`, which also appear in the workflow file
+  itself — so the grep always matches `.github/workflows/ci.yml` and the job
+  fails unless that file stays excluded via the `:(exclude).github/workflows/ci.yml`
+  pathspec (ci.yml:61). Don't remove that exclusion.
+- **SPA test extraction**: `tests/test_spa.py`'s naive `extract_function()` regex
+  stops at the first standalone `}`, so it can't parse functions with nested
+  blocks (try/catch, e.g. `restorePlayer`). Use `extract_function_balanced()`
+  (test_spa.py:101) for those.
 
 ## Downloads
 
@@ -158,6 +185,11 @@ with pytest, `node --check` for JS, and a manual run.
   `files/` and `accounts/` concurrently. Don't assume those trees are static.
 - `venv/`, `accounts/`, `files/`, `config/`, `__pycache__/`, and `*.zip` are
   gitignored; account headers (cookies) and downloads are never committed.
+- The app is intentionally a self-contained single-script project with a
+  project-local `./venv`; it is **not** a PyPI package (that was considered and
+  explicitly rejected). Don't restructure it into a pip-installable layout.
+- The GitHub remote is `justaman045/multi-music-downloader`; `gh` is
+  authenticated, and CI runs on push to `main` (including the secret scan).
 - After code changes: run `venv/bin/python -m pytest tests/ -q`, then
   `node --check web/static/app.js` if JS changed, then
   `venv/bin/python ytm-ll-dl-modern.py --version` and a manual smoke test
