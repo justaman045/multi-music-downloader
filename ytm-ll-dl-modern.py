@@ -58,13 +58,14 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "6.6.9"
-APP_BUILD = "2026-10-19-expanded-player-double-tap-seek"
+APP_VERSION = "6.7.0"
+APP_BUILD = "2026-10-20-resilient-deno-setup"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -240,7 +241,7 @@ def ensure_environment() -> None:
             print("Then run the app again.")
             sys.exit(1)
 
-        install_deno(VENV_BIN)
+        _try_install_deno(VENV_BIN)
         return
 
     # Frozen build: provision external binaries into DATA_DIR/bin.
@@ -248,8 +249,37 @@ def ensure_environment() -> None:
     binary_dir.mkdir(parents=True, exist_ok=True)
 
     install_bundled_deno(binary_dir)
-    install_deno(binary_dir)
+    _try_install_deno(binary_dir)
     install_yt_dlp(binary_dir)
+
+
+def _try_install_deno(bin_dir: Path) -> None:
+    """Install Deno, but never let a failure stop the app.
+
+    Deno is yt-dlp's JS runtime for solving YouTube's challenge/POT. It
+    meaningfully improves download success, but it is not required to
+    start the app, browse the library, or play already-downloaded music.
+    GitHub also rate-limits the release API by source IP (HTTP 403), so
+    a hard failure here would make the app unusable for reasons that have
+    nothing to do with the user. Warn and carry on.
+    """
+    try:
+        install_deno(bin_dir)
+    except Exception as error:
+        print("=" * 72)
+        print("WARNING: could not set up Deno")
+        print("=" * 72)
+        print()
+        print(f"    {type(error).__name__}: {error}")
+        print()
+        print("Deno helps yt-dlp solve YouTube's download challenges. The app")
+        print("still works without it, but some downloads may fail until it is")
+        print("installed. Retry later with:")
+        print("    ytm-ll-dl-modern.py --version")
+        print()
+        print("If it keeps failing with 'rate limit exceeded', wait a few")
+        print("minutes (GitHub throttles by IP) and try again.")
+        print()
 
 
 def bundled_asset(name: str) -> Path | None:
@@ -284,6 +314,11 @@ def install_bundled_deno(bin_dir: Path) -> None:
     source = bundled_asset(f"bin/{name}")
 
     if source is None:
+        return
+
+    # Test hook (see install_deno): skip the bundled copy so the network
+    # download path and its failure handling can be exercised.
+    if os.environ.get("YTM_FORCE_DENO_FETCH") == "1":
         return
 
     target = bin_dir / name
@@ -368,6 +403,44 @@ def install_yt_dlp(bin_dir: Path) -> None:
         pass
 
 
+def _urlopen_retrying(
+    request: urllib.request.Request,
+    timeout: int,
+    *,
+    attempts: int = 4,
+) -> Any:
+    """urlopen with retries for transient/rate-limit failures.
+
+    GitHub rate-limits by source IP (HTTP 403/429), which is common right
+    after a burst of requests or from a shared egress. Back off and retry
+    instead of failing the whole startup; a 404 is a real "missing" and is
+    raised immediately.
+    """
+    delay = 3.0
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                raise
+            last_error = error
+            retryable = error.code in {403, 429} or 500 <= error.code < 600
+        except Exception as error:  # timeouts, resets, DNS
+            last_error = error
+            retryable = True
+
+        if not retryable or attempt == attempts:
+            break
+        time.sleep(delay)
+        delay *= 2
+
+    raise last_error if last_error else RuntimeError(
+        f"could not fetch {request.full_url}"
+    )
+
+
 def github_json(url: str) -> Any:
     request = urllib.request.Request(
         url,
@@ -376,10 +449,7 @@ def github_json(url: str) -> Any:
             "Accept": "application/vnd.github+json",
         },
     )
-    with urllib.request.urlopen(
-        request,
-        timeout=30,
-    ) as response:
+    with _urlopen_retrying(request, timeout=30) as response:
         return json.loads(
             response.read().decode("utf-8")
         )
@@ -393,10 +463,9 @@ def download_file(url: str, destination: Path) -> None:
         },
     )
 
-    with urllib.request.urlopen(
-        request,
-        timeout=120,
-    ) as response, destination.open("wb") as output:
+    with _urlopen_retrying(request, timeout=120) as response, destination.open(
+        "wb"
+    ) as output:
         shutil.copyfileobj(response, output)
 
 
@@ -404,6 +473,11 @@ def install_deno(bin_dir: Path) -> None:
     # Filename comes from deno_binary() so Windows gets the .exe suffix
     # everywhere (the launch path and this install path must agree).
     deno_path = bin_dir / deno_binary().name
+
+    # Test hook: pretend no working Deno is present so the download path
+    # (and its graceful-failure handling) can be exercised deterministically.
+    if os.environ.get("YTM_FORCE_DENO_FETCH") == "1":
+        deno_path.unlink(missing_ok=True)
 
     if deno_path.exists():
         try:

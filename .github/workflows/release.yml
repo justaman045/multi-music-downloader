@@ -90,6 +90,33 @@ jobs:
           else
             echo "Bundled Deno: no (the app will fetch it on first run)"
           fi
+          # Resilience check: GitHub rate-limits the Deno release API by IP
+          # (HTTP 403 "rate limit exceeded"), which is exactly what broke
+          # this job before. Force the app to fetch Deno into a *fresh* data
+          # dir with no network at all, and require it to warn and keep
+          # working instead of aborting.
+          export YTM_DATA_DIR="$RUNNER_TEMP/ytm-cold"
+          rm -rf "$YTM_DATA_DIR"
+          mkdir -p "$YTM_DATA_DIR"
+          # Remove any Deno the binary just unpacked, so the app really has
+          # to fetch it and really fails.
+          rm -f "$YTM_DATA_DIR"/bin/deno "$YTM_DATA_DIR"/bin/deno.exe
+          set +e
+          out=$(YTM_FORCE_DENO_FETCH=1 \
+                HTTPS_PROXY="http://127.0.0.1:9" HTTP_PROXY="http://127.0.0.1:9" \
+                timeout 300 "$BIN" --version 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ $code -ne 0 ]; then
+            echo "FAIL: binary exited $code when the Deno fetch failed" >&2
+            exit 1
+          fi
+          case "$out" in
+            *"v6."*) ;;
+            *) echo "FAIL: --version output not recognised" >&2; exit 1;;
+          esac
+          echo "Cold-start / Deno-fetch resilience OK (exit $code)"
           echo "Smoke test OK"
 
       - name: Ad-hoc codesign (macOS)

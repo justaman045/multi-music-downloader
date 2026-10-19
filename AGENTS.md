@@ -315,6 +315,24 @@ with pytest, `node --check` for JS, and a manual run.
   the build, and both workflows cache `packaging/.vendor` via `actions/cache`.
   A bundled Deno is nice-to-have, not required: the app fetches it on first run.
   Keep `build.yml` and `release.yml` matrices/steps in sync.
+- **Deno setup must never abort startup** (v6.7.0): the CI smoke test revealed
+  a second, deeper instance of the same root cause. `ensure_environment()`
+  (ytm-ll-dl-modern.py:203, called at **import time** on line 634) used to call
+  `install_deno()` bare, so a 403 raised during import — the frozen binary
+  could not even print `--version`. The app's own `github_json()`/`download_file()`
+  now share `_urlopen_retrying()` (same retry/backoff/404-fast-fail policy as
+  `packaging/build.py`), and both `install_deno` call sites go through
+  `_try_install_deno()`, which warns and continues. Deno improves yt-dlp's
+  challenge solving but is **not** required to start, browse, or play
+  (`install_yt_dlp` already degraded this way — Deno was the outlier). Tests:
+  `tests/test_standalone.py` regression cases for the warning, the quiet happy
+  path, and the retry policy.
+- **`YTM_FORCE_DENO_FETCH=1`** makes `install_deno`/`install_bundled_deno`
+  ignore any existing/bundled Deno so the download path is exercised
+  deterministically. The CI smoke test sets it with an unroutable
+  `HTTPS_PROXY` and asserts the binary **exits 0** and still prints a version —
+  the exact scenario that failed the macOS job. Without the hook the smoke test
+  is vacuous (a bundled Deno short-circuits the fetch).
 - **SPA test extraction**: `tests/test_spa.py`'s naive `extract_function()` regex
   stops at the first standalone `}`, so it can't parse functions with nested
   blocks (try/catch, e.g. `restorePlayer`). Use `extract_function_balanced()`

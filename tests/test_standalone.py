@@ -617,3 +617,128 @@ def test_cookieless_403_failure_detection_and_hint(isolated_app):
     # The hint must not flip the premium classification of the reason.
     assert not isolated_app.is_premium_failure(hinted)
     assert "signed-out" in isolated_app.COOKIELESS_403_HINT
+
+
+def test_force_deno_fetch_hook_skips_existing_deno(isolated_app, tmp_path, monkeypatch):
+    """YTM_FORCE_DENO_FETCH makes install_deno ignore a present binary.
+
+    CI uses this to exercise the download/failure path deterministically,
+    instead of hoping the bundled Deno is absent.
+    """
+    import urllib.error
+
+    fake = tmp_path / isolated_app.deno_binary().name
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+
+    monkeypatch.setenv("YTM_FORCE_DENO_FETCH", "1")
+
+    def boom(_req, timeout=None):
+        raise urllib.error.HTTPError("u", 403, "rate limit exceeded", None, None)
+
+    monkeypatch.setattr(isolated_app.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(isolated_app.time, "sleep", lambda _s: None)
+
+    # With the hook set, the existing binary is discarded and the fetch is
+    # attempted (and here fails) rather than short-circuiting.
+    with pytest.raises(urllib.error.HTTPError):
+        isolated_app.install_deno(tmp_path)
+    assert not fake.exists(), "the hook must remove the stale binary"
+
+
+def test_deno_install_failure_does_not_abort_startup(isolated_app, tmp_path, capsys):
+    """A failed Deno install must warn and continue, never raise.
+
+    Regression: GitHub rate-limits the release API by source IP (HTTP 403
+    "rate limit exceeded"), and CI hit it on the macOS build. ensure_
+    environment() runs at import time, so an exception there meant the
+    binary could not even print --version. Deno improves download success
+    but is not required to start the app.
+    """
+    import urllib.error
+
+    def boom(_bin_dir):
+        raise urllib.error.HTTPError(
+            "https://api.github.com/x", 403, "rate limit exceeded", None, None
+        )
+
+    original = isolated_app.install_deno
+    isolated_app.install_deno = boom
+    try:
+        # Must return normally (no exception propagates).
+        isolated_app._try_install_deno(tmp_path)
+    finally:
+        isolated_app.install_deno = original
+
+    out = capsys.readouterr().out
+    assert "could not set up Deno" in out
+    assert "rate limit exceeded" in out
+    assert "still works without it" in out
+
+
+def test_deno_install_success_is_quiet(isolated_app, tmp_path):
+    """The happy path must not print the degradation warning."""
+    calls = []
+
+    def ok(bin_dir):
+        calls.append(bin_dir)
+
+    original = isolated_app.install_deno
+    isolated_app.install_deno = ok
+    try:
+        isolated_app._try_install_deno(tmp_path)
+    finally:
+        isolated_app.install_deno = original
+
+    assert calls == [tmp_path]
+
+
+def test_github_fetch_retries_rate_limit_but_not_404(isolated_app, monkeypatch):
+    """Transient 403/429/5xx are retried with backoff; 404 is not.
+
+    The retry is what lets a burst of concurrent builds survive GitHub's
+    IP-based throttling instead of failing outright.
+    """
+    import urllib.error
+    import urllib.request
+
+    monkeypatch.setattr(isolated_app.time, "sleep", lambda _s: None)
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return b'{"assets": []}'
+
+    # 403 twice, then success.
+    seen = {"n": 0}
+
+    def flaky(_request, timeout=None):
+        seen["n"] += 1
+        if seen["n"] <= 2:
+            raise urllib.error.HTTPError("u", 403, "rate limit", None, None)
+        return Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+    assert isolated_app.github_json("https://example.invalid") == {"assets": []}
+    assert seen["n"] == 3
+
+    # A 404 means "genuinely missing" — fail fast, don't burn retries.
+    seen["n"] = 0
+
+    def missing(_request, timeout=None):
+        seen["n"] += 1
+        raise urllib.error.HTTPError("u", 404, "not found", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", missing)
+    try:
+        isolated_app.github_json("https://example.invalid")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 404
+    else:  # pragma: no cover - the call must raise
+        raise AssertionError("a 404 should propagate")
+    assert seen["n"] == 1
