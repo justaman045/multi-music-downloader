@@ -413,6 +413,17 @@ with pytest, `node --check` for JS, and a manual run.
   `gh release upload --clobber` (stable download links, assets replaced in
   place). It matches only branches — never `v*` tags — so it cannot
   re-trigger release.yml.
+- **A stuck `build.yml` run can wedge every future push**: the workflow uses
+  `concurrency.group: build-executables-${{ github.ref }}`. With
+  `cancel-in-progress: false` the group is strictly first-come-first-served, so
+  a run parked on a scarce runner (macOS jobs have sat queued for hours) blocks
+  all later pushes indefinitely — the newer runs sit at `pending` with **zero
+  jobs**, which looks like a GitHub outage but is self-inflicted. Fix: the group
+  is now `cancel-in-progress: true` (a newer push supersedes an older build) and
+  the build job sets `timeout-minutes: 90`. If it ever wedges again, cancel the
+  stale run (`gh run cancel <id>`) to release the group. `release.yml` keeps the
+  job timeout but has no concurrency block — a tagged release must never be
+  cancelled by a later tag.
 
 ## Caveats
 

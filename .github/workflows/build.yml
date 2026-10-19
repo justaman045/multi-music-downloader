@@ -15,10 +15,14 @@ on:
 permissions:
   contents: write
 
-# Serialize builds; a newer push replaces the queued run.
+# Serialize builds so two pushes don't race on the same release assets.
+# cancel-in-progress is true on purpose: a *newer* push supersedes an older
+# build, and without it a run stuck waiting for a scarce runner (macOS jobs
+# have been queued for hours) blocks every later push forever, because
+# cancel-in-progress: false makes the group strictly first-come-first-served.
 concurrency:
   group: build-executables-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -44,6 +48,10 @@ jobs:
     name: Build (${{ matrix.os }})
     needs: test
     runs-on: ${{ matrix.os }}
+    # A macOS job can sit queued for hours waiting for a scarce runner.
+    # Cap the whole job so it fails cleanly (and publish can still run for
+    # the platforms that did build) instead of hanging the pipeline.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

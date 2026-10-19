@@ -15,6 +15,9 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # macOS runners can take hours to become available; a cap keeps a
+    # starved job from hanging the release instead of failing cleanly.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
