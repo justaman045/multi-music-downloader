@@ -2,9 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>YT Music Downloader</title>
-  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#121212" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="LocalSpot" />
+  <title>LocalSpot</title>
+  <link rel="icon" id="favicon" href="/assets/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/assets/styles.css" />
 </head>
 <body>
@@ -71,6 +76,7 @@
     <main id="main">
       <header id="topbar">
         <div class="topbar-left">
+          <button id="btn-menu" class="icon-btn nav-toggle" title="Menu">&#9776;</button>
           <button id="btn-back" class="icon-btn" title="Back">&#8592;</button>
           <button id="btn-refresh" class="icon-btn" title="Refresh library (r)">
             &#8635;
@@ -115,6 +121,7 @@
     </footer>
   </div>
 
+  <div id="queue-backdrop" class="hidden"></div>
   <div id="queue-drawer" class="queue-drawer hidden">
     <div class="queue-head">
       <div class="queue-title">Up next</div>
@@ -136,6 +143,7 @@
 
   <div id="toasts"></div>
   <div id="modal-root"></div>
+  <div id="nav-backdrop" class="hidden"></div>
 
   <script src="/assets/app.js" defer></script>
 </body>

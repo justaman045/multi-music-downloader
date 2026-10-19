@@ -30,6 +30,8 @@ const state = {
   _tokenPrompting: false,
   _renderSeq: 0,
   settings: null,            // cached /api/settings
+  smartRules: null,          // draft smart-view rules (renderSongs)
+  _smartViewId: null,        // which view loaded the draft rules
   sleepTimer: { endAt: null, interval: null, endOfSong: false },
   _playReported: false,      // one play report per track playback
 };
@@ -117,30 +119,63 @@ function artPlaceholderFor(img) {
 }
 
 function withToken(url) {
-  if (!state.token || !url || !url.startsWith("/api/")) return url;
-  const u = new URL(url, location.origin);
-  u.searchParams.set("token", state.token);
-  return u.href;
+  if (!state.token || !url) return url;
+  if (url.startsWith("/api/")) {
+    const u = new URL(url, location.origin);
+    u.searchParams.set("token", state.token);
+    return u.href;
+  }
+  try {
+    const u = new URL(url, location.origin);
+    if (u.pathname.startsWith("/api/")) {
+      u.searchParams.set("token", state.token);
+      return u.href;
+    }
+  } catch (e) {
+    // ignore
+  }
+  return url;
 }
 
-async function promptToken() {
+async function promptToken(rejected = false) {
   const value = await modal(
     "API token required",
     `
-    <p style="color:var(--text-dim)">This server requires a token. Enter it to continue.</p>
-    <input name="token" class="input" type="password" placeholder="Token" style="width:100%;margin:12px 0" value="${esc(state.token)}"/>
+    <p style="color:var(--text-dim)">${rejected ? "That token was rejected. " : ""}This server requires a token. Enter it to continue. The server prints the token in the terminal where you started it (it is also in the "Network" link that was shown).</p>
+    <input name="token" class="input" type="password" placeholder="Token"
+      autocomplete="off" autocapitalize="none" autocorrect="off"
+      spellcheck="false" style="width:100%;margin:12px 0" value="${rejected ? "" : esc(state.token)}"/>
     `,
     [
       { label: "Cancel", value: () => false },
-      { label: "Save", variant: "btn-primary", value: () => $("#modal-root input[name='token']").value, autoFocus: { name: "token" } },
+      { label: "Save", variant: "btn-primary", value: () => ($("#modal-root input[name='token']").value || "").trim(), autoFocus: { name: "token" } },
     ],
   );
   if (value) {
-    state.token = value.trim();
+    state.token = value;
     localStorage.setItem("ls-token", state.token);
     return true;
   }
   return false;
+}
+
+function captureUrlToken() {
+  // A LAN share link carries the token (?token=...), so a phone that opens
+  // the printed URL signs in automatically. Take it, persist it, then strip
+  // it from the address bar so it does not linger in history.
+  try {
+    const params = new URLSearchParams(location.search);
+    const fromUrl = params.get("token");
+    if (!fromUrl) return;
+    state.token = fromUrl.trim();
+    localStorage.setItem("ls-token", state.token);
+    params.delete("token");
+    const query = params.toString();
+    history.replaceState(
+      null, "",
+      location.pathname + (query ? `?${query}` : "") + location.hash,
+    );
+  } catch (e) { /* ignore */ }
 }
 
 async function api(path, opts = {}) {
@@ -151,15 +186,28 @@ async function api(path, opts = {}) {
     options.headers["Content-Type"] = "application/json";
   }
   let res = await fetch(path, options);
-  if (res.status === 401 && state.token === "" && !state._tokenPrompting) {
+  if (res.status === 401 && !state._tokenPrompting) {
     state._tokenPrompting = true;
+    let acted = false;
+    let reauthed = false;
     try {
-      if (await promptToken()) {
+      if (await promptToken(!!state.token)) {
+        acted = true;
         options.headers["Authorization"] = `Bearer ${state.token}`;
         res = await fetch(path, options);
+        reauthed = res.status !== 401;
+        if (reauthed) {
+          // The SSE stream was opened before the token existed (or with a
+          // stale one); rebuild it now that we are authenticated, otherwise
+          // live updates stay dead until a manual reload.
+          connectEvents();
+        }
       }
     } finally {
       state._tokenPrompting = false;
+    }
+    if (acted && !reauthed) {
+      toast("Token rejected — check the token printed by the server", "error");
     }
   }
   const text = await res.text();
@@ -216,6 +264,7 @@ function modal(title, bodyHTML, actions = []) {
       root.classList.add("hidden");
       root.innerHTML = "";
       root.dataset.open = "0";
+      root.onkeydown = null;
       document.removeEventListener("keydown", onKey, true);
       resolve(value);
     };
@@ -227,6 +276,18 @@ function modal(title, bodyHTML, actions = []) {
       }
     };
     document.addEventListener("keydown", onKey, true);
+    // Enter inside a single-line input submits the primary action, so the
+    // token prompt (and similar) is usable on a phone keyboard. Deliberately
+    // ignores textareas (newlines) and button focus (confirm dialogs), so it
+    // never auto-triggers a destructive action.
+    root.onkeydown = (e) => {
+      if (e.key !== "Enter" || !e.target || e.target.tagName !== "INPUT") return;
+      const primary = $$("button[data-a].btn-primary", root)[0];
+      if (primary) {
+        e.preventDefault();
+        primary.click();
+      }
+    };
     $(".modal-bg", root).onclick = () => close(null);
     $$("button[data-a]", root).forEach((btn) => {
       btn.onclick = () => {
@@ -351,13 +412,20 @@ const audio = state.player.audio;
 
 function streamUrl(track) {
   if (!track || !track.stream) return null;
-  const flac = /\.flac$/i.test(track.ext || "");
-  if (flac && !canPlayFlac()) {
-    const u = new URL(track.stream, location.origin);
-    u.searchParams.set("format", "opus");
-    return u.href;
+  let u;
+  try {
+    u = new URL(track.stream, location.origin);
+  } catch (e) {
+    return null;
   }
-  return track.stream;
+  if (u.pathname.startsWith("/api/")) {
+    if (state.token) u.searchParams.set("token", state.token);
+  }
+  const flac = /\.flac$/i.test(track.ext || u.pathname.split(".").pop() || "");
+  if (flac && !canPlayFlac()) {
+    u.searchParams.set("format", "opus");
+  }
+  return u.href;
 }
 
 function canPlayFlac() {
@@ -422,7 +490,7 @@ function restorePlayer() {
   if (snap.repeat === "off" || snap.repeat === "all" || snap.repeat === "one") {
     state.player.repeat = snap.repeat;
   }
-  state.player._playReported = false;
+  state._playReported = false;
   const track = queue[index];
   audio.src = streamUrl(track);
   audio.volume = state.player.muted ? 0 : state.player.volume;
@@ -430,13 +498,17 @@ function restorePlayer() {
 }
 
 function setQueue(tracks, startIndex = 0) {
+  const clicked = tracks[startIndex] || tracks[0];
+  if (clicked && !clicked.stream) {
+    toast(`"${clicked.title || "This track"}" isn't downloaded yet`, "info");
+    return;
+  }
   state.player.queue = queueFor(tracks);
   state.player.index = -1;
   if (!state.player.queue.length) {
     stopPlayback("Nothing to play in this list");
     return;
   }
-  const clicked = tracks[startIndex] || tracks[0];
   const idx = clicked
     ? state.player.queue.findIndex((t) => t.id === clicked.id && t.account === clicked.account)
     : 0;
@@ -558,6 +630,7 @@ audio.addEventListener("timeupdate", () => {
   $("#cur-time").textContent = fmtTime(audio.currentTime);
   $("#dur-time").textContent = fmtTime(audio.duration);
   if (audio.currentTime / audio.duration >= 0.6) reportPlay();
+  updateMediaPositionState();
 });
 
 async function reportPlay() {
@@ -581,7 +654,11 @@ async function reportPlay() {
 audio.addEventListener("play", () => { state.player.playing = true; updatePlayerUI(); });
 audio.addEventListener("pause", () => { state.player.playing = false; updatePlayerUI(); });
 audio.addEventListener("error", () => {
-  if (state.player.queue.length) toast("Could not play this file", "error");
+  if (state.player.queue.length) {
+    const track = state.player.queue[state.player.index];
+    const name = track?.title || "this track";
+    toast(`Couldn't play "${name}" — the file may have been moved or deleted; try refreshing the library.`, "error");
+  }
 });
 
 function updatePlayerUI() {
@@ -609,7 +686,119 @@ function updatePlayerUI() {
   $("#btn-mute").classList.toggle("active", state.player.muted);
   $("#volume").value = String(Math.round(state.player.volume * 100));
   markPlayingRows(track);
+  updateNowPlayingMeta(track);
   if (!$("#queue-drawer").classList.contains("hidden")) renderQueueDrawer();
+}
+
+/* -------------------------------------------------------------------------
+ * Now-playing cosmetics
+ * Keeps the browser tab title, the tab favicon (album art) and the OS /
+ * lock-screen media controls (Media Session API) in sync with playback.
+ * ---------------------------------------------------------------------- */
+
+function updateNowPlayingMeta(track) {
+  updateDocumentTitle();
+  setFaviconFromArt(track && track.art ? track.art : null);
+  applyMediaSession(track);
+}
+
+function updateDocumentTitle() {
+  const track = currentTrack();
+  if (track) {
+    // A play/pause marker makes the now-playing song obvious from the tab.
+    document.title = `${state.player.playing ? "\u25B6 " : ""}${track.title} — ${track.artist}`;
+  } else {
+    document.title = "LocalSpot";
+  }
+}
+
+function setFaviconFromArt(url) {
+  const link = $("#favicon");
+  if (!link) return;
+  const key = url || "";
+  if (state._faviconKey === key) return;   // unchanged — skip the redraw
+  state._faviconKey = key;
+  if (!url) {
+    link.type = "image/svg+xml";
+    link.href = "/assets/favicon.svg";
+    return;
+  }
+  // Draw the cover art into a square canvas and use it as the tab icon.
+  // Same-origin art keeps the canvas untainted; a cross-origin image would
+  // throw on toDataURL(), which we simply swallow.
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const size = 64;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      const scale = Math.max(size / img.width, size / img.height);
+      const w = img.width * scale;
+      const h = img.height * scale;
+      ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+      link.type = "image/png";
+      link.href = canvas.toDataURL("image/png");
+    } catch (e) { /* tainted canvas — keep the current icon */ }
+  };
+  img.src = url;
+}
+
+function applyMediaSession(track) {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    if (!track) {
+      navigator.mediaSession.metadata = null;
+      navigator.mediaSession.playbackState = "none";
+      return;
+    }
+    if (typeof MediaMetadata !== "undefined") {
+      const artwork = track.art
+        ? [
+          { src: track.art, sizes: "96x96", type: "image/jpeg" },
+          { src: track.art, sizes: "512x512", type: "image/jpeg" },
+        ]
+        : [];
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: track.title || "",
+        artist: track.artist || "",
+        album: track.album || "",
+        artwork,
+      });
+    }
+    navigator.mediaSession.playbackState = state.player.playing ? "playing" : "paused";
+  } catch (e) { /* unsupported — ignore */ }
+}
+
+/* Feeds the lock-screen/notification scrubber its duration and position. */
+function updateMediaPositionState() {
+  if (!("mediaSession" in navigator)) return;
+  if (typeof navigator.mediaSession.setPositionState !== "function") return;
+  const d = audio.duration;
+  if (!d || isNaN(d)) return;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration: d,
+      playbackRate: audio.playbackRate || 1,
+      position: Math.min(audio.currentTime || 0, d),
+    });
+  } catch (e) { /* invalid state — ignore */ }
+}
+
+function wireMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  const bind = (action, handler) => {
+    try { navigator.mediaSession.setActionHandler(action, handler); } catch (e) { /* unsupported action */ }
+  };
+  bind("play", () => { if (audio.paused) togglePlay(); });
+  bind("pause", () => { if (!audio.paused) togglePlay(); });
+  bind("nexttrack", () => next());
+  bind("previoustrack", () => prev());
+  bind("stop", () => stopPlayback());
+  bind("seekbackward", (d) => { audio.currentTime = Math.max(0, audio.currentTime - (d.seekOffset || 10)); });
+  bind("seekforward", (d) => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + (d.seekOffset || 10)); });
+  bind("seekto", (d) => { if (typeof d.seekTime === "number") audio.currentTime = d.seekTime; });
 }
 
 function markPlayingRows(track) {
@@ -692,10 +881,19 @@ function sleepTimerDialog() {
  * Queue drawer
  * ---------------------------------------------------------------------- */
 
+function closeQueueDrawer() {
+  $("#queue-drawer").classList.add("hidden");
+  const bd = $("#queue-backdrop");
+  if (bd) bd.classList.add("hidden");
+}
+
 function toggleQueueDrawer() {
   const drawer = $("#queue-drawer");
-  drawer.classList.toggle("hidden");
-  if (!drawer.classList.contains("hidden")) renderQueueDrawer();
+  const willOpen = drawer.classList.contains("hidden");
+  drawer.classList.toggle("hidden", !willOpen);
+  const bd = $("#queue-backdrop");
+  if (bd) bd.classList.toggle("hidden", !willOpen);
+  if (willOpen) renderQueueDrawer();
 }
 
 function renderQueueDrawer() {
@@ -719,6 +917,9 @@ function renderQueueDrawer() {
     row.onclick = () => { playIndex(Number(row.dataset.i)); renderQueueDrawer(); };
   });
   $("#queue-list").scrollTop = 0;
+  // Keep the now-playing row visible when the drawer is opened mid-queue.
+  const current = $(".queue-item.current", list);
+  if (current && current.scrollIntoView) current.scrollIntoView({ block: "nearest" });
 }
 
 /* -------------------------------------------------------------------------
@@ -869,7 +1070,7 @@ function trackRowsHTML(tracks) {
   const showAccount = state.scope === "all";
   return tracks.map((t, i) => `
     <tr data-id="${esc(t.id)}" data-account="${esc(t.account)}" data-index="${i}">
-      <td style="color:var(--text-faint);width:36px">${i + 1}</td>
+      <td class="col-index" style="color:var(--text-faint);width:36px">${i + 1}</td>
       <td>
         <div class="track-cell">
           <div class="mini-art" data-name="${esc(t.artist)}">
@@ -881,16 +1082,18 @@ function trackRowsHTML(tracks) {
           </div>
         </div>
       </td>
-      <td style="color:var(--text-dim)">${esc(t.album || "—")}</td>
-      ${showAccount ? `<td><span class="q-badge">${esc(t.account_name)}</span></td>` : ""}
-      <td style="color:var(--text-dim)">${esc(t.year || "—")}</td>
-      <td style="color:var(--text-dim)">${fmtDuration(t.duration)}</td>
-      <td style="color:var(--text-dim)">${t.plays ? t.plays : "—"}</td>
-      <td>
+      <td class="col-album" style="color:var(--text-dim)">${esc(t.album || "—")}</td>
+      ${showAccount ? `<td class="col-account"><span class="q-badge">${esc(t.account_name)}</span></td>` : ""}
+      <td class="col-year" style="color:var(--text-dim)">${esc(t.year || "—")}</td>
+      <td class="col-duration" style="color:var(--text-dim)">${fmtDuration(t.duration)}</td>
+      <td class="col-plays" style="color:var(--text-dim)">${t.plays ? t.plays : "—"}</td>
+      <td class="col-quality">
         <span class="q-badge"><span class="state-dot ${esc(t.status)}"></span>${esc(t.status === "premium" ? "Premium" : (t.quality || "Not downloaded"))}</span>
       </td>
-      <td>${needsDownload(t) ? `<button class="btn btn-ghost row-dl" data-id="${esc(t.id)}" data-account="${esc(t.account)}" title="Download to ${esc(t.account_name)}">&#8681;</button>` : ""}</td>
-      <td><button class="btn btn-ghost row-pl" data-id="${esc(t.id)}" data-account="${esc(t.account)}" data-title="${esc(t.title)}" data-artist="${esc(t.artist)}" title="Add to playlist">&#43;</button></td>
+      <td class="col-dl">${needsDownload(t) ? `<button class="btn btn-ghost row-dl" data-id="${esc(t.id)}" data-account="${esc(t.account)}" title="Download to ${esc(t.account_name)}">&#8681;</button>` : ""}</td>
+      <td class="col-pl"><button class="btn btn-ghost row-pl" data-id="${esc(t.id)}" data-account="${esc(t.account)}" title="Add to playlist">&#10010;</button></td>
+      <td class="col-queue"><button class="btn btn-ghost row-queue" data-id="${esc(t.id)}" data-account="${esc(t.account)}" title="Add to download queue">&#9776;</button></td>
+      <td class="col-tags"><button class="btn btn-ghost row-tags" data-id="${esc(t.id)}" data-account="${esc(t.account)}" title="Edit tags">&#9998;</button></td>
     </tr>`).join("");
 }
 
@@ -899,16 +1102,18 @@ function trackTable(tracks, opts = {}) {
   const showAccount = state.scope === "all";
   const online = tracks.filter(needsDownload);
   const head = `
-    <th data-col="index">#</th>
+    <th class="col-index" data-col="index">#</th>
     <th data-col="title">Title</th>
-    <th data-col="album">Album</th>
-    ${showAccount ? '<th data-col="account">Account</th>' : ""}
-    <th data-col="year">Year</th>
-    <th data-col="duration">Duration</th>
-    <th data-col="plays">Plays</th>
-    <th data-col="quality">Quality</th>
-    <th></th>
-    <th></th>`;
+    <th class="col-album" data-col="album">Album</th>
+    ${showAccount ? '<th class="col-account" data-col="account">Account</th>' : ""}
+    <th class="col-year" data-col="year">Year</th>
+    <th class="col-duration" data-col="duration">Duration</th>
+    <th class="col-plays" data-col="plays">Plays</th>
+    <th class="col-quality" data-col="quality">Quality</th>
+    <th class="col-dl"></th>
+    <th class="col-pl"></th>
+    <th class="col-queue"></th>
+    <th class="col-tags"></th>`;
 
   return `
     <div class="filter-bar">
@@ -1013,6 +1218,30 @@ function bindTrackTable(container, allTracks) {
       addToPlaylistModal(t);
     };
   });
+
+  if (table) $$(".row-queue", table).forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const t = allTracks.find((x) => x.id === btn.dataset.id && x.account === btn.dataset.account);
+      if (!t) return;
+      try {
+        const r = await api("/api/queue", {
+          method: "POST",
+          body: { tracks: [{ video_id: t.id, account: t.account, title: t.title, artist: t.artist }] },
+        });
+        toast(`Queued “${t.title}” (${r.queued} waiting)`, "success");
+      } catch (err) { toast(err.message, "error"); }
+    };
+  });
+
+  if (table) $$(".row-tags", table).forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const t = allTracks.find((x) => x.id === btn.dataset.id && x.account === btn.dataset.account);
+      if (!t) return;
+      await editTagsModal(t);
+    };
+  });
 }
 
 async function addToPlaylistModal(track) {
@@ -1054,6 +1283,53 @@ async function addToPlaylistModal(track) {
       body: { tracks: [{ video_id: track.id, account: track.account }] },
     });
     toast(`Added to playlist (${r.added ?? 0} added)`, r.added ? "success" : "info");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function editTagsModal(track) {
+  const saved = await modal(`Edit tags — ${track.title}`, `
+    <div class="label">Title</div>
+    <input id="tg-title" class="input" type="text" value="${esc(track.title || "")}" autocomplete="off" />
+    <div class="label" style="margin-top:10px">Artist</div>
+    <input id="tg-artist" class="input" type="text" value="${esc(track.artist || "")}" autocomplete="off" />
+    <div class="label" style="margin-top:10px">Album</div>
+    <input id="tg-album" class="input" type="text" value="${esc(track.album || "")}" autocomplete="off" />
+    <div class="filter-bar" style="margin-top:10px">
+      <div style="flex:1"><div class="label">Genre</div><input id="tg-genre" class="input" type="text" value="${esc(track.genre || "")}" autocomplete="off" /></div>
+      <div style="flex:1"><div class="label">Year</div><input id="tg-year" class="input" type="text" value="${esc(track.year || "")}" autocomplete="off" /></div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-top:10px">
+      Written into every downloaded quality file of this track and into the library index.
+    </p>`,
+    [
+      { label: "Cancel", value: () => false },
+      {
+        label: "Save tags",
+        variant: "btn-primary",
+        autoFocus: { name: "" },
+        value: () => {
+          const title = $("#tg-title").value.trim();
+          const artist = $("#tg-artist").value.trim();
+          if (!title || !artist) { toast("Title and artist cannot be empty", "warning"); return false; }
+          return {
+            title,
+            artist,
+            album: $("#tg-album").value.trim(),
+            genre: $("#tg-genre").value.trim(),
+            year: $("#tg-year").value.trim(),
+          };
+        },
+      },
+    ]);
+  if (!saved) return;
+  try {
+    const r = await api("/api/tags", {
+      method: "POST",
+      body: { slug: track.account, video_id: track.id, tags: saved },
+    });
+    toast(`Tags saved (${r.files ? r.files.length : 0} file${r.files && r.files.length === 1 ? "" : "s"} updated)`, "success");
+    await loadLibrary();
+    navigate();
   } catch (e) { toast(e.message, "error"); }
 }
 
@@ -1119,9 +1395,18 @@ async function renderHome() {
         <div class="card-title">${esc(t.title)}</div>
         <div class="card-sub">${esc(t.artist)}</div>`;
       node.onclick = () => {
+        if (t && !t.stream) {
+          toast(`"${t.title || "This track"}" isn't downloaded yet`, "info");
+          return;
+        }
         const all = visibleTracks().filter((x) => x.stream);
         const idx = all.findIndex((x) => x.id === t.id && x.account === t.account);
-        setQueue(all, idx >= 0 ? idx : 0);
+        if (idx >= 0) {
+          setQueue(all, idx);
+          return;
+        }
+        const playable = visibleTracks().filter((x) => x.stream);
+        if (playable.length) setQueue(playable, 0);
       };
       $(el).appendChild(node);
     });
@@ -1130,11 +1415,206 @@ async function renderHome() {
   grid("#top-grid", topPlayed);
 }
 
+/* -------------------------------------------------------------------------
+ * Smart views — saved library filters (localStorage "ls-smart-views").
+ * Each view is a fixed rule set (status/account/plays/recency/sort/limit)
+ * applied on top of the current account scope.
+ * ---------------------------------------------------------------------- */
+const SV_RULE_DEFAULTS = {
+  status: "", account: "", minPlays: "", maxPlays: "",
+  addedWithinDays: "", sortCol: "", sortDir: 1, limit: "",
+};
+
+const SV_BUILTINS = [
+  { id: "all", name: "All tracks", rules: { ...SV_RULE_DEFAULTS } },
+  { id: "recent14", name: "Recently added (14d)", rules: { ...SV_RULE_DEFAULTS, addedWithinDays: 14, sortCol: "added", sortDir: -1 } },
+  { id: "not-dl", name: "Not downloaded", rules: { ...SV_RULE_DEFAULTS, status: "not_downloaded", sortCol: "title" } },
+  { id: "dl", name: "Downloaded", rules: { ...SV_RULE_DEFAULTS, status: "downloaded" } },
+  { id: "premium", name: "Premium blocked", rules: { ...SV_RULE_DEFAULTS, status: "premium" } },
+  { id: "missing", name: "Missing files", rules: { ...SV_RULE_DEFAULTS, status: "missing", sortCol: "title" } },
+  { id: "unplayed", name: "Never played", rules: { ...SV_RULE_DEFAULTS, maxPlays: 0, sortCol: "title" } },
+  { id: "top", name: "Top played (50)", rules: { ...SV_RULE_DEFAULTS, sortCol: "plays", sortDir: -1, limit: 50 } },
+];
+
+function loadSmartViews() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("ls-smart-views"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) { return []; }
+}
+
+function saveSmartViews(views) {
+  localStorage.setItem("ls-smart-views", JSON.stringify(views));
+}
+
+function activeSmartViewId() {
+  return localStorage.getItem("ls-smart-view-active") || "all";
+}
+
+function findSmartView(id) {
+  return SV_BUILTINS.find((v) => v.id === id)
+    || loadSmartViews().find((v) => v.id === id)
+    || SV_BUILTINS[0];
+}
+
+function applySmartRules(tracks, rules) {
+  const r = { ...SV_RULE_DEFAULTS, ...(rules || {}) };
+  const nowSec = Date.now() / 1000;
+  let out = tracks.filter((t) => {
+    if (r.status === "downloaded" && t.status !== "downloaded") return false;
+    if (r.status === "not_downloaded" && t.status === "downloaded") return false;
+    if (r.status === "premium" && t.status !== "premium") return false;
+    if (r.status === "missing" && t.status !== "missing") return false;
+    if (r.account && t.account !== r.account) return false;
+    if (r.minPlays !== "" && (t.plays || 0) < Number(r.minPlays)) return false;
+    if (r.maxPlays !== "" && (t.plays || 0) > Number(r.maxPlays)) return false;
+    if (r.addedWithinDays !== "") {
+      if (!t.added) return false;
+      if (t.added < nowSec - Number(r.addedWithinDays) * 86400) return false;
+    }
+    return true;
+  });
+  if (r.sortCol) {
+    const dir = Number(r.sortDir) >= 0 ? 1 : -1;
+    out = [...out].sort((a, b) => {
+      const av = a[r.sortCol]; const bv = b[r.sortCol];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (typeof av === "number" && typeof bv === "number") return (av - bv) * dir;
+      return String(av).localeCompare(String(bv)) * dir;
+    });
+  }
+  if (r.limit !== "" && Number(r.limit) > 0) out = out.slice(0, Number(r.limit));
+  return out;
+}
+
+function smartViewBuilderHTML(rules, activeId) {
+  const views = loadSmartViews();
+  const isCustom = views.some((v) => v.id === activeId);
+  const opt = (v) => `<option value="${esc(v.id)}" ${v.id === activeId ? "selected" : ""}>${esc(v.name)}</option>`;
+  return `
+    <div class="filter-bar" style="flex-wrap:wrap;gap:8px">
+      <select id="sv-select" class="input" style="width:auto;min-width:170px" title="Smart view">
+        <optgroup label="Built-in">${SV_BUILTINS.map(opt).join("")}</optgroup>
+        ${views.length ? `<optgroup label="Saved views">${views.map(opt).join("")}</optgroup>` : ""}
+      </select>
+      <select id="sv-status" class="input" style="width:auto" title="Download status">
+        <option value="" ${!rules.status ? "selected" : ""}>Any status</option>
+        <option value="downloaded" ${rules.status === "downloaded" ? "selected" : ""}>Downloaded</option>
+        <option value="not_downloaded" ${rules.status === "not_downloaded" ? "selected" : ""}>Not downloaded</option>
+        <option value="premium" ${rules.status === "premium" ? "selected" : ""}>Premium blocked</option>
+        <option value="missing" ${rules.status === "missing" ? "selected" : ""}>Missing files</option>
+      </select>
+      <select id="sv-account" class="input" style="width:auto" title="Account">
+        <option value="" ${!rules.account ? "selected" : ""}>Any account</option>
+        ${(state.library ? state.library.accounts : []).map((a) =>
+          `<option value="${esc(a.slug)}" ${rules.account === a.slug ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+      </select>
+      <input id="sv-min-plays" class="input" style="width:82px" type="number" min="0" placeholder="Min plays" value="${rules.minPlays !== "" ? esc(String(rules.minPlays)) : ""}" title="Minimum play count" />
+      <input id="sv-days" class="input" style="width:96px" type="number" min="0" placeholder="Added ≤ days" value="${rules.addedWithinDays !== "" ? esc(String(rules.addedWithinDays)) : ""}" title="Only tracks added in the last N days" />
+      <select id="sv-sort" class="input" style="width:auto" title="Sort by">
+        <option value="" ${!rules.sortCol ? "selected" : ""}>Default order</option>
+        <option value="title" ${rules.sortCol === "title" ? "selected" : ""}>Title</option>
+        <option value="artist" ${rules.sortCol === "artist" ? "selected" : ""}>Artist</option>
+        <option value="album" ${rules.sortCol === "album" ? "selected" : ""}>Album</option>
+        <option value="year" ${rules.sortCol === "year" ? "selected" : ""}>Year</option>
+        <option value="duration" ${rules.sortCol === "duration" ? "selected" : ""}>Duration</option>
+        <option value="plays" ${rules.sortCol === "plays" ? "selected" : ""}>Plays</option>
+        <option value="added" ${rules.sortCol === "added" ? "selected" : ""}>Date added</option>
+      </select>
+      <button id="sv-dir" class="btn btn-ghost" title="Toggle sort direction">${Number(rules.sortDir) >= 0 ? "↑ asc" : "↓ desc"}</button>
+      <button id="sv-save" class="btn btn-ghost" title="Save the current filters as a view">＋ Save view</button>
+      ${isCustom ? `<button id="sv-delete" class="btn btn-ghost" title="Delete this saved view">Delete</button>` : ""}
+    </div>`;
+}
+
+async function saveSmartViewDialog(rules) {
+  const name = await modal("Save smart view", `
+    <div class="label">View name</div>
+    <input id="sv-name" class="input" type="text" placeholder="e.g. Fresh downloads this week" autocomplete="off" />`,
+    [
+      { label: "Cancel", value: () => false },
+      { label: "Save", variant: "btn-primary", autoFocus: { name: "" },
+        value: () => {
+          const n = $("#sv-name").value.trim();
+          if (!n) { toast("Give the view a name", "warning"); return false; }
+          return n;
+        } },
+    ]);
+  if (!name) return null;
+  const views = loadSmartViews().filter((v) => v.name.toLowerCase() !== name.toLowerCase());
+  const view = { id: `sv-${Date.now().toString(36)}`, name, rules: { ...rules } };
+  views.push(view);
+  saveSmartViews(views);
+  return view;
+}
+
+function wireSmartViewBar(baseTracks) {
+  const sel = $("#sv-select", view);
+  if (!sel) return;
+  const rerender = () => renderSongs();
+
+  sel.onchange = () => {
+    localStorage.setItem("ls-smart-view-active", sel.value);
+    state.smartRules = { ...SV_RULE_DEFAULTS, ...findSmartView(sel.value).rules };
+    rerender();
+  };
+
+  const bindRule = (id, key, numeric) => {
+    const el = $(id, view);
+    if (!el) return;
+    el.onchange = () => {
+      state.smartRules[key] = numeric ? (el.value === "" ? "" : Number(el.value)) : el.value;
+      rerender();
+    };
+  };
+  bindRule("#sv-status", "status", false);
+  bindRule("#sv-account", "account", false);
+  bindRule("#sv-min-plays", "minPlays", true);
+  bindRule("#sv-days", "addedWithinDays", true);
+  bindRule("#sv-sort", "sortCol", false);
+
+  const dirBtn = $("#sv-dir", view);
+  if (dirBtn) dirBtn.onclick = () => {
+    state.smartRules.sortDir = Number(state.smartRules.sortDir) >= 0 ? -1 : 1;
+    rerender();
+  };
+
+  const saveBtn = $("#sv-save", view);
+  if (saveBtn) saveBtn.onclick = async () => {
+    const created = await saveSmartViewDialog(state.smartRules);
+    if (!created) return;
+    localStorage.setItem("ls-smart-view-active", created.id);
+    toast(`Saved view “${created.name}”`, "success");
+    rerender();
+  };
+
+  const delBtn = $("#sv-delete", view);
+  if (delBtn) delBtn.onclick = async () => {
+    const ok = await confirmModal("Delete smart view", "Remove this saved view? Your library is not affected.");
+    if (!ok) return;
+    const id = activeSmartViewId();
+    saveSmartViews(loadSmartViews().filter((v) => v.id !== id));
+    localStorage.setItem("ls-smart-view-active", "all");
+    state.smartRules = { ...SV_RULE_DEFAULTS };
+    rerender();
+  };
+}
+
 async function renderSongs() {
-  const tracks = visibleTracks();
+  const base = visibleTracks();
+  const activeId = activeSmartViewId();
+  if (!state.smartRules || state._smartViewId !== activeId) {
+    state.smartRules = { ...SV_RULE_DEFAULTS, ...findSmartView(activeId).rules };
+    state._smartViewId = activeId;
+  }
+  const tracks = applySmartRules(base, state.smartRules);
   view.innerHTML = `
-    <div class="section-head"><h2>All songs <span style="color:var(--text-faint);font-weight:600;font-size:14px">${tracks.length}</span></h2></div>
-    ${tracks.length ? trackTable(tracks) : empty("No songs yet. Add an account and refresh your library.")}`;
+    <div class="section-head"><h2>All songs <span style="color:var(--text-faint);font-weight:600;font-size:14px">${tracks.length}${tracks.length !== base.length ? ` / ${base.length}` : ""}</span></h2></div>
+    ${smartViewBuilderHTML(state.smartRules, activeId)}
+    ${base.length ? trackTable(tracks) : empty("No songs yet. Add an account and refresh your library.")}`;
+  wireSmartViewBar(base);
   bindTrackTable(view, tracks);
 }
 
@@ -1355,7 +1835,7 @@ async function renderMostPlayed() {
   $$("#view table.tracks tbody tr", view).forEach((row) => {
     row.onclick = () => {
       const track = libTracks.find((t) => t.id === row.dataset.id);
-      if (!track) return;
+      if (!track) { toast("This track isn't in your downloaded library yet", "info"); return; }
       if (!track.stream) { toast(`"${track.title}" isn't downloaded yet`, "info"); return; }
       const tracks = libTracks.filter((t) => t.stream);
       const idx = tracks.findIndex((t) => t.id === track.id);
@@ -1491,7 +1971,7 @@ async function populateWithinDuplicates(seq) {
     const groups = acc.groups || [];
     html += `<div class="dup-section">
       <div class="dup-title">${esc(acc.name)} (${groups.length} group${groups.length === 1 ? "" : "s"})</div>
-      ${groups.length ? groups.map((g) => `
+      ${groups.length ? groups.map((g, gi) => `
         <div class="dup-title" style="padding:10px 0 4px;color:var(--text-dim)">${esc(g.title)} — ${esc(g.artist)}</div>
         ${g.tracks.map((t) => `
           <div class="check-row">
@@ -1500,7 +1980,7 @@ async function populateWithinDuplicates(seq) {
               <span>${esc(t.title)} <span style="color:var(--text-faint)">${t.album ? esc("[" + t.album + "]") : ""} · ${(t.qualities || []).join(", ")}</span></span>
             </label>
           </div>`).join("")}
-        ${g.tracks.length > 1 ? `<button class="btn btn-ghost" style="margin:6px 0 10px;padding:5px 12px;font-size:12px" data-within-keep="${esc(acc.slug)}" data-keep-vid="${esc(g.tracks[0].video_id)}" data-keep-label="${esc(g.tracks[0].title)}">Keep first copy</button>` : ""}
+        ${g.tracks.length > 1 ? `<button class="btn btn-ghost" style="margin:6px 0 10px;padding:5px 12px;font-size:12px" data-within-keep="${esc(acc.slug)}" data-group-idx="${gi}" data-keep-vid="${esc(g.tracks[0].video_id)}" data-keep-label="${esc(g.tracks[0].title)}">Keep first copy</button>` : ""}
       `).join("") : `<div class="empty-state" style="padding:12px">No within-account duplicates.</div>`}
     </div>`;
   }
@@ -1511,9 +1991,14 @@ async function populateWithinDuplicates(seq) {
     btn.onclick = async () => {
       const group = data.find((a) => a.slug === btn.dataset.withinKeep);
       const keep = btn.dataset.keepVid;
-      const entry = group?.groups?.flatMap((g) => g.tracks).find((t) => t.video_id === keep);
+      // Scope removal to the ONE group this button belongs to: flattening
+      // every group would delete copies from unrelated duplicate groups too.
+      const gi = Number(btn.dataset.groupIdx);
+      const grp = (Number.isInteger(gi) && group?.groups?.[gi])
+        || group?.groups?.find((g) => g.tracks.some((t) => t.video_id === keep));
+      const entry = grp?.tracks.find((t) => t.video_id === keep);
       const label = `${btn.dataset.keepLabel}${entry?.album ? " [" + entry.album + "]" : ""}`.trim();
-      const others = group?.groups?.flatMap((g) => g.tracks).filter((t) => t.video_id !== keep) || [];
+      const others = grp ? grp.tracks.filter((t) => t.video_id !== keep) : [];
       const ok = await confirmModal("Remove duplicate copies", `Keep “${label}” and remove ${others.length} other copy/copies (unlike + delete files)?`);
       if (!ok) return;
       try {
@@ -1746,7 +2231,11 @@ async function renderDownloads() {
     <div class="section-head"><h2>Downloads</h2>
       ${sessions.length ? `<button id="dl-cancel-all" class="btn btn-danger" style="float:right">&#10005; Cancel all</button>` : ""}
     </div>
-    ${sessions.length ? "" : `<div class="empty-state"><div class="big">&#8681;</div>No active download sessions. Start one from any song list or the download buttons.</div>`}`;
+    ${sessions.length ? "" : `<div class="empty-state"><div class="big">&#8681;</div>No active download sessions. Start one from any song list or the download buttons.</div>`}
+    <div class="section-head" style="margin-top:20px"><h3>Download queue</h3></div>
+    <div id="queue-panel" class="panel"><div class="empty-state" style="padding:14px">Loading…</div></div>
+    <div class="section-head" style="margin-top:20px"><h3>Schedule</h3></div>
+    <div id="scheduler-panel" class="panel"><div class="empty-state" style="padding:14px">Loading…</div></div>`;
 
   sessions.forEach((s) => {
     const counts = s.counts || {};
@@ -1814,6 +2303,179 @@ async function renderDownloads() {
       } catch (e) { toast(e.message, "error"); }
     };
   });
+
+  renderQueuePanel();
+  renderSchedulerPanel();
+}
+
+/* --------------------------------------------------------------------------
+ * Download queue panel (persistent queue + auto-start + scheduling).
+ * ----------------------------------------------------------------------- */
+
+async function renderQueuePanel() {
+  const panel = $("#queue-panel");
+  if (!panel) return;
+  let data;
+  try { data = await api("/api/queue"); } catch (e) {
+    panel.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+    return;
+  }
+  const items = data.items || [];
+  const nameOf = (slug) => (state.library?.accounts || []).find((a) => a.slug === slug)?.name || slug;
+
+  panel.innerHTML = `
+    <div class="check-row" style="align-items:center;flex-wrap:wrap;gap:8px">
+      <span style="color:var(--text-dim)">${items.length} track${items.length === 1 ? "" : "s"} queued</span>
+      <label class="check-label" style="margin-left:auto;cursor:pointer">
+        <input id="q-auto" type="checkbox" ${data.auto_start ? "checked" : ""} />
+        Auto-start when a session slot frees up
+      </label>
+      ${items.length ? `
+        <button id="q-clear" class="btn btn-ghost">Clear</button>
+        <button id="q-start" class="btn btn-primary">Start queue</button>` : ""}
+    </div>
+    ${items.length ? items.map((it) => `
+      <div class="check-row" style="justify-content:space-between">
+        <span style="flex:1;min-width:0">
+          <strong>${esc(it.title || it.video_id)}</strong>
+          <span style="color:var(--text-dim)"> — ${esc(it.artist || "")}</span>
+          <span style="color:var(--text-faint);display:block;font-size:12px">${esc(nameOf(it.account))}</span>
+        </span>
+        <button class="btn btn-ghost q-remove" data-id="${esc(it.id)}" title="Remove from queue">&#10005;</button>
+      </div>`).join("") : `<div class="empty-state" style="padding:12px">Use the <strong>+Q</strong> button on any song to line up downloads for later.</div>`}`;
+
+  $("#q-auto", panel).onchange = async (e) => {
+    try {
+      await api("/api/queue/auto", { method: "POST", body: { enabled: e.target.checked } });
+      toast(e.target.checked ? "Queue will auto-start when slots free up" : "Auto-start off", "info");
+    } catch (err) { toast(err.message, "error"); e.target.checked = !e.target.checked; }
+  };
+
+  $$(".q-remove", panel).forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await api("/api/queue/remove", { method: "POST", body: { ids: [btn.dataset.id] } });
+        renderQueuePanel();
+      } catch (err) { toast(err.message, "error"); }
+    };
+  });
+
+  const clearBtn = $("#q-clear", panel);
+  if (clearBtn) clearBtn.onclick = async () => {
+    const ok = await confirmModal("Clear download queue", `Remove ${items.length} queued track${items.length === 1 ? "" : "s"} from the queue?`);
+    if (!ok) return;
+    try {
+      await api("/api/queue/clear", { method: "POST", body: {} });
+      toast("Queue cleared", "info");
+      renderQueuePanel();
+    } catch (err) { toast(err.message, "error"); }
+  };
+
+  const startBtn = $("#q-start", panel);
+  if (startBtn) startBtn.onclick = async () => {
+    const config = await downloadDialog({ title: "Start download queue" });
+    if (!config) return;
+    try {
+      const r = await api("/api/queue/start", {
+        method: "POST",
+        body: { quality: config.quality, existing_policy: config.existing_policy, session: config.session },
+      });
+      if (!r.started.length && !r.deferred.length) {
+        toast(r.dropped ? `Nothing started — ${r.dropped} stale item${r.dropped === 1 ? "" : "s"} cleaned up` : "Queue is empty", "info");
+      } else {
+        const parts = [];
+        if (r.started.length) parts.push(`Started for ${r.started.map(nameOf).join(", ")}`);
+        if (r.deferred.length) parts.push(`${r.deferred.map(nameOf).join(", ")} busy — retried when free`);
+        if (r.dropped) parts.push(`${r.dropped} stale dropped`);
+        toast(parts.join(" · "), "success");
+      }
+      renderQueuePanel();
+      if (state.route === "downloads") renderDownloads();
+    } catch (err) { toast(err.message, "error"); }
+  };
+}
+
+function fmtAgo(seconds) {
+  if (seconds == null) return "never";
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+  return `${Math.round(seconds / 86400)}d ago`;
+}
+
+async function renderSchedulerPanel() {
+  const panel = $("#scheduler-panel");
+  if (!panel) return;
+  let s;
+  try { s = await api("/api/scheduler"); } catch (e) {
+    panel.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+    return;
+  }
+  const settings = state.settings || {};
+  const mostRecent = (bySlug) => {
+    const values = Object.values(bySlug || {}).filter((v) => v != null);
+    return values.length ? Math.min(...values) : null;
+  };
+  const rows = [
+    {
+      label: "Library refresh",
+      every: settings.auto_refresh_interval_hours > 0 ? `every ${settings.auto_refresh_interval_hours}h` : "off",
+      last: fmtAgo(mostRecent(s.last_refresh)),
+      task: null,
+    },
+    {
+      label: "Premium retry",
+      every: settings.premium_retry_interval_days > 0 ? `every ${settings.premium_retry_interval_days}d` : "off",
+      last: fmtAgo(mostRecent(s.last_premium_retry)),
+      task: "premium_retry",
+    },
+    {
+      label: "Backup",
+      every: settings.backup_interval_hours > 0 ? `every ${settings.backup_interval_hours}h` : "off",
+      last: fmtAgo(s.last_backup),
+      task: "backup",
+    },
+    {
+      label: "yt-dlp update check",
+      every: "daily",
+      last: fmtAgo(s.last_ytdlp_check),
+      task: "ytdlp_check",
+    },
+    {
+      label: "last.fm scrobble flush",
+      every: "hourly",
+      last: fmtAgo(s.last_scrobble_flush),
+      task: "scrobble_flush",
+    },
+  ];
+
+  panel.innerHTML = `
+    <div class="check-row">
+      <span style="color:var(--text-dim)">${s.running ? "Scheduler running" : "Scheduler not running"} · pending auto-downloads: ${(s.pending_auto_download || []).join(", ") || "none"}</span>
+      <a class="btn btn-ghost" href="#/settings">Edit intervals</a>
+    </div>
+    ${rows.map((r) => `
+      <div class="check-row" style="justify-content:space-between">
+        <span style="flex:1;min-width:0">
+          <strong>${esc(r.label)}</strong>
+          <span style="color:var(--text-faint);display:block;font-size:12px">${esc(r.every)} · last run ${esc(r.last)}</span>
+        </span>
+        ${r.task ? `<button class="btn btn-ghost sched-run" data-task="${r.task}">Run now</button>` : ""}
+      </div>`).join("")}`;
+
+  $$(".sched-run", panel).forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const r = await api(`/api/scheduler/${btn.dataset.task}`, { method: "POST" });
+        if (r && r.error) toast(r.error, "error");
+        else if (r && Array.isArray(r.started) && r.started.length) toast(`Premium retry started for ${r.started.length} account${r.started.length === 1 ? "" : "s"}`, "success");
+        else toast(`${btn.textContent.trim()} — done`, "success");
+      } catch (e) { toast(e.message, "error"); }
+      btn.disabled = false;
+      renderSchedulerPanel();
+    };
+  });
 }
 
 async function renderAccounts() {
@@ -1824,11 +2486,18 @@ async function renderAccounts() {
       <h3>&#65291; Add account</h3>
       <div class="label">Account name</div>
       <input id="acc-name" class="input" type="text" placeholder="e.g. Shay Mercer" />
-      <div class="label">Request headers (from browser Developer Tools → Network → /browse request)</div>
+      <div class="label" style="margin-top:10px">Sign in automatically — import the sign-in your browser already has</div>
+      <div class="check-row" style="gap:8px;flex-wrap:wrap">
+        <select id="acc-browser" class="input" style="max-width:260px"><option value="">Detecting browsers…</option></select>
+        <select id="acc-profile" class="input" style="max-width:240px"><option value="">Auto-detect profile</option></select>
+        <button id="acc-import" class="btn">Import sign-in</button>
+      </div>
+      <div class="label" style="margin-top:10px">Request headers (manual fallback: Developer Tools → Network → /browse request)</div>
       <textarea id="acc-headers" class="input" placeholder="Paste the complete 'Copy request headers' block here…"></textarea>
       <div class="modal-actions" style="margin-top:14px">
         <button id="acc-test" class="btn btn-ghost">Test &amp; Add</button>
       </div>
+      <div class="label" style="margin-top:10px">Google "Sign in with Google" can't be used: Google blocks third-party apps from reading a YouTube Music library. Browser import reads your browser's local cookies — nothing is uploaded anywhere.</div>
     </div>
     <div class="panel">
       <h3>Connected accounts</h3>
@@ -1866,6 +2535,65 @@ async function renderAccounts() {
     }
   };
 
+  const importBtn = $("#acc-import");
+  if (importBtn) {
+    importBtn.onclick = async () => {
+      const name = $("#acc-name").value.trim() || "My Account";
+      const browser = $("#acc-browser").value;
+      const profile = $("#acc-profile").value.trim();
+      if (!browser) { toast("Choose a browser to import from", "error"); return; }
+      importBtn.disabled = true;
+      try {
+        await api("/api/accounts", { method: "POST", body: { name, browser, profile } });
+        toast(`Account ${name} added`, "success");
+        $("#acc-name").value = "";
+        $("#acc-profile").value = "";
+        await loadLibrary();
+        renderAccounts();
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        importBtn.disabled = false;
+      }
+    };
+  }
+
+  // Populate the browser + profile pickers from locally detected
+  // browsers. The profile list follows the selected browser; the
+  // empty ("") profile option means auto-detect the signed-in one.
+  let detectedBrowsers = [];
+  const populateProfiles = () => {
+    const profileSelect = $("#acc-profile");
+    const browserSelect = $("#acc-browser");
+    if (!profileSelect || !browserSelect) return;
+    const entry = detectedBrowsers.find((b) => b.id === browserSelect.value);
+    const profiles = entry && Array.isArray(entry.profiles) ? entry.profiles : [];
+    profileSelect.innerHTML = `<option value="">Auto-detect profile</option>` + profiles.map((p) => {
+      const when = p.last_used ? new Date(p.last_used * 1000).toISOString().slice(5, 10) : "";
+      const mark = p.session === true ? " ✓" : "";
+      const label = `${p.name || p.id} (${p.id})${when ? " · " + when : ""}${mark}`;
+      return `<option value="${esc(p.id)}">${esc(label)}</option>`;
+    }).join("");
+  };
+  api("/api/browsers").then((browsers) => {
+    const select = $("#acc-browser");
+    if (!select) return;
+    const list = Array.isArray(browsers) ? browsers : [];
+    detectedBrowsers = list;
+    if (!list.length) {
+      select.innerHTML = `<option value="">No supported browser found</option>`;
+      populateProfiles();
+      return;
+    }
+    select.innerHTML = `<option value="">Select a browser…</option>` + list.map((b) =>
+      `<option value="${esc(b.id)}"${b.available ? "" : " disabled"}>${esc(b.label)}${b.available ? "" : " (not installed)"}</option>`
+    ).join("");
+    const first = list.find((b) => b.available);
+    if (first) select.value = first.id;
+    select.onchange = populateProfiles;
+    populateProfiles();
+  }).catch(() => {});
+
   $$("[data-act]", view).forEach((btn) => {
     const slug = btn.dataset.slug;
     const act = btn.dataset.act;
@@ -1889,7 +2617,7 @@ async function renderAccounts() {
 
 async function renderSettings() {
   let settings = {};
-  try { settings = await api("/api/settings"); } catch (e) {}
+  try { settings = await api("/api/settings"); state.settings = settings; } catch (e) {}
 
   const accent = localStorage.getItem("ls-accent") || "#1db954";
 
@@ -1970,6 +2698,29 @@ async function renderSettings() {
       <div class="filter-bar" style="margin-top:6px">
         <div style="flex:1"><div class="label">Keep newest N backups</div><input id="set-keep-backups" class="input" type="number" min="1" max="200" value="20" /></div>
         <div style="flex:1;display:flex;align-items:flex-end;padding-bottom:6px"><button id="set-prune-backups" class="btn btn-ghost">&#128465; Prune old backups</button></div>
+      </div>
+      <div class="label" style="margin-top:14px">Export &amp; sync library</div>
+      <div class="filter-bar">
+        <button id="set-exp-m3u" class="btn btn-ghost">&#128196; Export M3U</button>
+        <button id="set-exp-csv" class="btn btn-ghost">&#128202; Export CSV</button>
+        <button id="set-exp-json" class="btn btn-ghost">&#128190; Export JSON</button>
+      </div>
+      <div class="label">Sync downloaded files to a folder (media servers, phone, NAS…)</div>
+      <div class="filter-bar">
+        <div style="flex:2"><input id="set-sync-target" class="input" type="text" placeholder="/home/you/Music/LocalSpot" value="${esc(localStorage.getItem("ls-sync-target") || "")}" autocomplete="off" /></div>
+        <div style="flex:1"><select id="set-sync-scope" class="input">
+          <option value="">All accounts</option>
+          ${(state.library?.accounts || []).map((a) => `<option value="${esc(a.slug)}" ${state.scope === a.slug ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+        </select></div>
+        <div style="flex:1"><select id="set-sync-mode" class="input">
+          <option value="link">Hardlink (no extra space)</option>
+          <option value="copy">Copy files</option>
+        </select></div>
+      </div>
+      <div class="filter-bar">
+        <button id="set-sync-run" class="btn btn-ghost">&#8681; Sync now</button>
+        <button id="set-sync-dry" class="btn btn-ghost">Dry run (preview)</button>
+        <span style="color:var(--text-faint);font-size:12px;align-self:center">Target: Account/Artist/Album/filename</span>
       </div>
       <div class="modal-actions" style="margin-top:18px">
         <button id="set-save" class="btn btn-primary">Save settings</button>
@@ -2095,6 +2846,52 @@ async function renderSettings() {
       renderBackups();
     } catch (e) { toast(e.message, "error"); }
   };
+
+  const runLibraryExport = async (fmt) => {
+    try {
+      const r = await api("/api/export/library", { method: "POST", body: { format: fmt } });
+      toast(`Library exported to ${r.file}`, "success");
+    } catch (e) { toast(e.message, "error"); }
+  };
+  $("#set-exp-m3u").onclick = () => runLibraryExport("m3u");
+  $("#set-exp-csv").onclick = () => runLibraryExport("csv");
+  $("#set-exp-json").onclick = () => runLibraryExport("json");
+
+  const runLibrarySync = async (dryRun) => {
+    const target = $("#set-sync-target").value.trim();
+    if (!target) { toast("Enter a target folder first", "warning"); return; }
+    const btn = dryRun ? $("#set-sync-dry") : $("#set-sync-run");
+    btn.disabled = true;
+    try {
+      const r = await api("/api/sync", {
+        method: "POST",
+        body: {
+          target,
+          slug: $("#set-sync-scope").value || null,
+          mode: $("#set-sync-mode").value,
+          dry_run: dryRun,
+        },
+      });
+      localStorage.setItem("ls-sync-target", target);
+      const parts = [
+        dryRun ? "Preview:" : "Synced:",
+        `${r.scanned} file${r.scanned === 1 ? "" : "s"}`,
+        r.linked ? `${r.linked} linked` : "",
+        r.copied ? `${r.copied} copied` : "",
+        r.replaced ? `${r.replaced} replaced` : "",
+        r.skipped ? `${r.skipped} already in place` : "",
+        r.missing ? `${r.missing} not downloaded` : "",
+      ].filter(Boolean);
+      if (r.errors && r.errors.length) {
+        parts.push(`${r.errors.length} error${r.errors.length === 1 ? "" : "s"} (see console)`);
+        console.warn("sync errors:", r.errors);
+      }
+      toast(parts.join(" · "), (r.errors && r.errors.length) ? "warning" : "success");
+    } catch (e) { toast(e.message, "error"); }
+    btn.disabled = false;
+  };
+  $("#set-sync-run").onclick = () => runLibrarySync(false);
+  $("#set-sync-dry").onclick = () => runLibrarySync(true);
 }
 
 async function renderBackups() {
@@ -2446,7 +3243,10 @@ async function renderStats() {
         ${[7, 30, 90].map((d) => `<button class="btn btn-ghost hist-range" data-days="${d}">${d}d</button>`).join("")}
       </div>
     </div>
-    <div id="history-view"><div class="empty-state" style="padding:20px">Loading history…</div></div>`;
+    <div id="insights-view"></div>
+    <div id="history-view"><div class="empty-state" style="padding:20px">Loading history…</div></div>
+    <div class="section-head" style="margin-top:18px"><h3>Scrobbling</h3></div>
+    <div id="scrobble-panel" class="panel"><div class="empty-state" style="padding:14px">Loading…</div></div>`;
 
   if (Object.keys(perAccount).length) {
     html += `<div class="section-head" style="margin-top:18px"><h3>Plays by account</h3></div>
@@ -2495,6 +3295,29 @@ async function renderStats() {
     const topArtists = h.top_artists || [];
     const topAlbums = h.top_albums || [];
 
+    // Insight cards — streaks and the week comparison are computed
+    // server-side from the full play log (not just the visible range).
+    const streaks = h.streaks || { current: 0, best: 0 };
+    const week = h.week || { this: 0, prev: 0 };
+    let deltaHTML = `<span style="color:var(--text-faint)">vs prior 7d: no data</span>`;
+    if (week.prev > 0) {
+      const pct = Math.round(((week.this - week.prev) / week.prev) * 100);
+      const up = pct >= 0;
+      deltaHTML = `<span style="color:${up ? "var(--accent)" : "var(--danger)"}">${up ? "▲" : "▼"} ${Math.abs(pct)}% vs prior 7 days</span>`;
+    } else if (week.this > 0) {
+      deltaHTML = `<span style="color:var(--accent)">▲ new vs prior 7 days</span>`;
+    }
+    const insights = $("#insights-view");
+    if (insights) {
+      insights.innerHTML = `
+        <div class="stat-grid" style="margin-bottom:14px">
+          <div class="stat-card"><div class="stat-value">${streaks.current}</div><div class="stat-label">Day listening streak</div></div>
+          <div class="stat-card"><div class="stat-value">${streaks.best}</div><div class="stat-label">Best streak</div></div>
+          <div class="stat-card"><div class="stat-value">${week.this.toLocaleString()}</div><div class="stat-label">Plays — last 7 days</div><div style="font-size:11.5px;margin-top:5px">${deltaHTML}</div></div>
+          <div class="stat-card"><div class="stat-value">${daysList.length}</div><div class="stat-label">Active days in range</div></div>
+        </div>`;
+    }
+
     let hh = "";
     if (daysList.length) {
       hh += `<div class="panel"><div class="bar-chart">
@@ -2506,11 +3329,24 @@ async function renderStats() {
       </div></div>`;
     }
 
+    const perHour = h.per_hour || [];
+    if (perHour.some((v) => v > 0)) {
+      const maxH = Math.max(1, ...perHour);
+      hh += `<div class="section-head" style="margin-top:18px"><h3>Listening by hour of day</h3></div>
+        <div class="panel"><div class="bar-chart">
+          ${perHour.map((count, hour) => `
+            <div class="bar-col" title="${String(hour).padStart(2, "0")}:00 — ${count} play${count === 1 ? "" : "s"}">
+              <div class="bar-fill" style="height:${count ? Math.max(4, Math.round((count / maxH) * 110)) : 2}px;${count ? "" : "opacity:.3"}"></div>
+              <div class="bar-label">${hour === 0 ? "12a" : hour === 12 ? "12p" : hour === 6 ? "6a" : hour === 18 ? "6p" : hour % 3 === 0 ? hour + "h" : ""}</div>
+            </div>`).join("")}
+        </div></div>`;
+    }
+
     if (topTracks.length) {
       hh += `<div class="section-head" style="margin-top:18px"><h3>Most played tracks — last ${days} days</h3></div>
         <div class="panel"><table class="tracks"><thead><tr><th>#</th><th>Title</th><th>Plays</th></tr></thead><tbody>
           ${topTracks.map((t, i) => `
-            <tr data-id="${esc(t.id)}" data-account="${esc(t.account)}">
+            <tr data-id="${esc(t.id)}" data-account="${esc(t.account)}" data-index="${i}">
               <td style="color:var(--text-faint)">${i + 1}</td>
               <td><div class="track-cell"><div class="mini-art" data-name="${esc(t.artist)}">
                 ${t.art ? `<img src="${esc(t.art)}" loading="lazy" onerror="this.outerHTML=artPlaceholderFor(this)"/>` : artPlaceholder(t.artist)}
@@ -2539,10 +3375,51 @@ async function renderStats() {
     }
 
     box.innerHTML = hh;
-    if (topTracks.length) bindTrackTable(box, topTracks.map((t) => ({ ...t, id: t.id, stream: true })));
+    if (topTracks.length) {
+      const lib = state.library ? state.library.tracks : [];
+      const byKey = new Map(lib.map((x) => [x.id + "###" + x.account, x]));
+      bindTrackTable(box, topTracks.map((t) => byKey.get(t.id + "###" + t.account) || { ...t, stream: null }));
+    }
   };
 
   state._historySeq = 0;
+
+  const fillScrobblePanel = async () => {
+    const box = $("#scrobble-panel");
+    if (!box) return;
+    let s;
+    try { s = await api("/api/lastfm"); } catch (e) {
+      box.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+      return;
+    }
+    if (!s.enabled) {
+      box.innerHTML = `<div style="font-size:13px;color:var(--text-dim)">last.fm scrobbling is off — enable it in <a href="#/settings">Settings</a> to share what you play.</div>`;
+      return;
+    }
+    box.innerHTML = `
+      <div class="check-row"><strong>Account</strong><span style="margin-left:auto;color:var(--text-dim)">${esc(s.username || (s.session_key ? "connected" : "not linked"))}</span></div>
+      <div class="check-row"><strong>Queued scrobbles</strong><span style="margin-left:auto;color:var(--text-dim)">${s.queued || 0} waiting</span></div>
+      ${s.last_error ? `<div class="check-row"><span style="color:var(--danger);font-size:12.5px">Last error: ${esc(s.last_error)}</span></div>` : ""}
+      <div class="filter-bar" style="margin-top:10px">
+        <button id="lfm-flush" class="btn btn-ghost">Flush now</button>
+        <a class="btn btn-ghost" href="#/settings">Settings</a>
+      </div>`;
+    const flushBtn = $("#lfm-flush");
+    if (flushBtn) flushBtn.onclick = async () => {
+      flushBtn.disabled = true;
+      try {
+        const r = await api("/api/lastfm/flush", { method: "POST", body: {} });
+        if (r.error && !r.sent) toast(r.error, "error");
+        else toast(
+          `Sent ${r.sent || 0} scrobble${(r.sent || 0) === 1 ? "" : "s"}${r.failed ? `, ${r.failed} failed` : ""}`,
+          (r.failed || r.error) ? "warning" : "success",
+        );
+      } catch (e) { toast(e.message, "error"); }
+      fillScrobblePanel();
+    };
+  };
+  fillScrobblePanel();
+
   $$(".hist-range", view).forEach((btn) => {
     btn.onclick = () => {
       $$(".hist-range", view).forEach((b) => b.classList.remove("active"));
@@ -2631,7 +3508,14 @@ function renderSearchResults(query) {
       closeSearch();
       const all = tracks.filter((t) => t.stream);
       const idx = all.findIndex((t) => t.id === row.dataset.id && t.account === row.dataset.account);
-      if (idx >= 0) setQueue(all, idx);
+      if (idx >= 0) {
+        setQueue(all, idx);
+        return;
+      }
+      const t = tracks.find((x) => x.id === row.dataset.id && x.account === row.dataset.account);
+      if (t && !t.stream) {
+        toast(`"${t.title || "This track"}" isn't downloaded yet`, "info");
+      }
     };
   });
 
@@ -2867,12 +3751,22 @@ function renderRefreshUI() {
  * ---------------------------------------------------------------------- */
 
 function connectEvents() {
+  // Re-entrant: tear down any previous stream first, so entering a token
+  // after load (or a token change) doesn't leave an unauthenticated
+  // EventSource retrying forever against a 401.
+  if (state._events) {
+    try { state._events.close(); } catch (e) { /* ignore */ }
+    state._events = null;
+  }
+  if (state._pollTimer) { clearInterval(state._pollTimer); state._pollTimer = null; }
   const url = state.token ? `/api/events?token=${encodeURIComponent(state.token)}` : "/api/events";
   const source = new EventSource(url);
+  state._events = source;
   let pollTimer = null;
 
   const stopPolling = () => {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    state._pollTimer = null;
   };
 
   const startPolling = () => {
@@ -2886,6 +3780,7 @@ function connectEvents() {
         if (state.route === "downloads") renderDownloads();
       } catch (e) { /* keep polling */ }
     }, 5000);
+    state._pollTimer = pollTimer;
   };
 
   source.onmessage = (event) => {
@@ -2932,7 +3827,18 @@ function connectEvents() {
       const detail = `${data.downloaded} downloaded, ${data.failed} failed, ${data.skipped} skipped`;
       toast(`Download finished — ${detail}`, data.failed ? "info" : "success");
       notify(data.name ? `Download finished: ${data.name}` : "Download finished", detail);
+      if (state.route === "downloads") renderQueuePanel();
       loadLibrary().then(() => { if (["songs", "home", "playlists", "stats", "duplicates", "status"].includes(state.route)) navigate(); });
+      return;
+    }
+
+    if (data.type === "queue_started") {
+      const names = (data.accounts || []).map((slug) =>
+        (state.library?.accounts || []).find((a) => a.slug === slug)?.name || slug);
+      if (names.length) {
+        toast(`Queue: started for ${names.join(", ")} (${data.queued_left ?? "?"} still queued)`, "info");
+      }
+      if (state.route === "downloads") { renderDownloads(); } else { renderDownloadsBadge(); }
       return;
     }
 
@@ -3032,6 +3938,10 @@ function wirePlayer() {
     localStorage.setItem("ls-muted", state.player.muted ? "1" : "0");
     updatePlayerUI();
   };
+
+  const qb = $("#queue-backdrop");
+  if (qb) qb.onclick = closeQueueDrawer;
+  wireMediaSession();
 }
 
 /* -------------------------------------------------------------------------
@@ -3055,6 +3965,8 @@ document.addEventListener("keydown", (e) => {
     if (searchOpen) { closeSearch(); return; }
     const root = $("#modal-root");
     if (!root.classList.contains("hidden")) { root.classList.add("hidden"); root.innerHTML = ""; return; }
+    if (!$("#queue-drawer").classList.contains("hidden")) { closeQueueDrawer(); return; }
+    if (document.body.classList.contains("nav-open")) { closeNav(); return; }
   }
   if (searchOpen) {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); return; }
@@ -3093,6 +4005,39 @@ document.addEventListener("keydown", (e) => {
  * Init
  * ---------------------------------------------------------------------- */
 
+// ---------------------------------------------------------------------------
+// Mobile navigation drawer (sidebar is display:none-free below 900px: it
+// slides in instead, so small screens keep a working nav).
+// ---------------------------------------------------------------------------
+function openNav() {
+  document.body.classList.add("nav-open");
+  const bd = $("#nav-backdrop");
+  if (bd) bd.classList.remove("hidden");
+}
+
+function closeNav() {
+  document.body.classList.remove("nav-open");
+  const bd = $("#nav-backdrop");
+  if (bd) bd.classList.add("hidden");
+}
+
+function wireNavDrawer() {
+  const toggle = $("#btn-menu");
+  if (toggle) {
+    toggle.onclick = () => {
+      if (document.body.classList.contains("nav-open")) closeNav();
+      else openNav();
+    };
+  }
+  const bd = $("#nav-backdrop");
+  if (bd) bd.onclick = closeNav;
+  // Close after navigating from the drawer.
+  document.querySelectorAll("#sidebar a[href^='#/']").forEach((a) => {
+    a.addEventListener("click", closeNav);
+  });
+  window.addEventListener("hashchange", closeNav);
+}
+
 function wireTopbar() {
   $("#btn-back").onclick = () => history.back();
   $("#btn-search").onclick = openSearch;
@@ -3108,10 +4053,18 @@ function wireTopbar() {
 }
 
 async function init() {
+  captureUrlToken();
   applyAccent(localStorage.getItem("ls-accent") || "#1db954");
   wirePlayer();
   wireTopbar();
+  wireNavDrawer();
   connectEvents();
+  // Cache settings up front — notify() gates on
+  // state.settings.notifications_enabled and would silently never fire
+  // otherwise (only the settings-save path ever populated it).
+  try {
+    state.settings = await api("/api/settings");
+  } catch (e) { /* notify() stays gated off until settings load */ }
   try {
     await loadLibrary();
   } catch (e) {

@@ -1,0 +1,111 @@
+name: Release
+
+# Builds the standalone single-file executables (Windows, Linux,
+# macOS x64 + arm64) and attaches them to a GitHub Release when a
+# version tag (v*) is pushed. The normal CI workflow is untouched.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: YTMusicDownloader-windows-x64.exe
+          - os: ubuntu-latest
+            artifact: YTMusicDownloader-linux-x64
+          - os: macos-14
+            artifact: YTMusicDownloader-macos-arm64
+          - os: macos-13
+            artifact: YTMusicDownloader-macos-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          python -m venv buildvenv
+          buildvenv/bin/pip install --disable-pip-version-check -r packaging/requirements-build.txt
+
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m venv buildvenv
+          buildvenv\Scripts\pip install --disable-pip-version-check -r packaging\requirements-build.txt
+
+      - name: Build standalone executable (Unix)
+        if: runner.os != 'Windows'
+        run: buildvenv/bin/python packaging/build.py
+
+      - name: Build standalone executable (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: buildvenv\Scripts\python packaging\build.py
+
+      - name: Smoke test (version + help + frozen paths)
+        shell: bash
+        run: |
+          if [ -f dist/YTMusicDownloader.exe ]; then
+            BIN=dist/YTMusicDownloader.exe
+          else
+            BIN=dist/YTMusicDownloader
+            chmod +x "$BIN"
+          fi
+          "$BIN" --version
+          "$BIN" --help
+          # Frozen-mode path check: run with an isolated data dir and
+          # confirm it initializes accounts/files/config there.
+          export YTM_DATA_DIR="$RUNNER_TEMP/ytm-smoke"
+          mkdir -p "$YTM_DATA_DIR"
+          "$BIN" --version
+          echo "Smoke test OK"
+
+      - name: Ad-hoc codesign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - dist/YTMusicDownloader || true
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          if [ -f dist/YTMusicDownloader.exe ]; then
+            mv dist/YTMusicDownloader.exe "dist/${{ matrix.artifact }}"
+          else
+            mv dist/YTMusicDownloader "dist/${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    name: Attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

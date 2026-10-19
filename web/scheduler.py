@@ -121,8 +121,35 @@ class Scheduler:
         self._backup_if_due(settings, now)
         self._ytdlp_check_if_due(now)
         self._scrobble_flush_if_due(settings, now)
+        self._queue_auto_start(settings)
 
     # -- tasks -------------------------------------------------------------
+
+    def _queue_auto_start(self, settings: dict[str, Any]) -> None:
+        """When the persistent download queue has auto-start enabled,
+        pick up the next batch for every account whose session slot has
+        freed up. start_queued_batches itself skips busy accounts and
+        stale items, so this is safe to call on every tick."""
+        from . import queue as queue_mod
+
+        try:
+            data = queue_mod.load_queue(self.app)
+        except Exception:
+            return
+        if not data.get("auto_start") or not data["items"]:
+            return
+        try:
+            result = queue_mod.start_queued_batches(self.app, self.downloads)
+        except Exception:
+            return
+        if result["started"]:
+            self.bus.broadcast(
+                {
+                    "type": "queue_started",
+                    "accounts": result["started"],
+                    "queued_left": result["queued_left"],
+                }
+            )
 
     def _auto_refresh(self, settings: dict[str, Any], now: float) -> None:
         hours = int(settings.get("auto_refresh_interval_hours", 0) or 0)

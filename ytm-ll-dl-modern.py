@@ -47,8 +47,10 @@ from __future__ import annotations
 import importlib
 import hashlib
 import json
+import os
 import platform
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -61,8 +63,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "6.2.0"
-APP_BUILD = "2026-08-15-player-restore"
+APP_VERSION = "6.6.8"
+APP_BUILD = "2026-10-19-mobile-polish-now-playing"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -70,13 +72,94 @@ VENV_DIR = PROJECT_DIR / "venv"
 VENV_BIN = VENV_DIR / "bin"
 VENV_PYTHON = VENV_BIN / "python"
 
+# PyInstaller (and similar freeze tools) set sys.frozen. A frozen build
+# has no project-local ./venv and its own __file__ points into a
+# temporary extraction dir, so external binaries (yt-dlp, Deno) and the
+# user's data must live elsewhere.
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def resolve_data_dir() -> Path:
+    """
+    Where user data (accounts/, files/, config/) and runtime binaries
+    (yt-dlp, Deno) live.
+
+    - Source runs keep the historical project-local layout.
+    - Frozen (standalone executable) runs use a per-user home-directory
+      location so the exe works from anywhere (Downloads, USB stick).
+    - YTM_DATA_DIR overrides everything, in both modes.
+    """
+    override = os.environ.get("YTM_DATA_DIR", "").strip()
+
+    if override:
+        return Path(override).expanduser().resolve()
+
+    if not IS_FROZEN:
+        return PROJECT_DIR
+
+    home = Path.home()
+
+    if sys.platform == "win32":
+        base = Path(
+            os.environ.get("APPDATA") or home / "AppData" / "Roaming"
+        )
+        return base / "YTMusicDownloader"
+
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "YTMusicDownloader"
+
+    base = Path(
+        os.environ.get("XDG_DATA_HOME") or home / ".local" / "share"
+    )
+    return base / "yt-music-downloader"
+
+
+DATA_DIR = resolve_data_dir()
+
+
+def runtime_bin_dir() -> Path:
+    """
+    Directory holding the external yt-dlp and Deno binaries: the
+    project-local venv in source runs, DATA_DIR/bin in frozen builds.
+    """
+    if IS_FROZEN:
+        return DATA_DIR / "bin"
+
+    return VENV_BIN
+
+
+def yt_dlp_binary() -> Path:
+    """
+    Path of the external yt-dlp binary (with the Windows extension
+    when required).
+    """
+    name = "yt-dlp.exe" if os.name == "nt" else "yt-dlp"
+
+    return runtime_bin_dir() / name
+
+
+def deno_binary() -> Path:
+    """
+    Path of the external Deno binary (with the Windows extension when
+    required).
+    """
+    name = "deno.exe" if os.name == "nt" else "deno"
+
+    return runtime_bin_dir() / name
+
 
 def require_virtualenv() -> bool:
     """
     This application only runs from inside a virtualenv. Returns
     True when a virtualenv is active, otherwise prints setup
     instructions and returns False.
+
+    Frozen (standalone executable) builds bundle their own runtime and
+    have no ./venv, so the guard is bypassed there.
     """
+    if IS_FROZEN:
+        return True
+
     if Path(sys.prefix) == VENV_DIR:
         return True
 
@@ -119,10 +202,14 @@ def require_virtualenv() -> bool:
 
 def ensure_environment() -> None:
     """
-    Verify the virtualenv runtime: required Python packages must be
-    importable and the project-local Deno binary must exist. Deno is
-    downloaded automatically when missing; missing Python packages
-    produce clear install instructions instead of an ImportError.
+    Verify the runtime: required Python packages must be importable and
+    the external Deno (and, in frozen builds, yt-dlp) binaries must
+    exist. Both binaries are provisioned automatically when missing;
+    missing Python packages produce clear install instructions instead
+    of an ImportError.
+
+    Frozen builds bundle their Python packages, so only the external
+    binaries are provisioned there.
     """
     required = (
         "textual",
@@ -131,28 +218,154 @@ def ensure_environment() -> None:
         "imageio_ffmpeg",
     )
 
-    missing = [
-        module
-        for module in required
-        if importlib.util.find_spec(module) is None
-    ]
+    if not IS_FROZEN:
+        missing = [
+            module
+            for module in required
+            if importlib.util.find_spec(module) is None
+        ]
 
-    if missing:
-        print("=" * 72)
-        print("YT MUSIC DOWNLOADER - MISSING DEPENDENCIES")
-        print("=" * 72)
-        print()
-        print("The virtualenv is missing required packages:")
-        for module in missing:
-            print(f"    - {module}")
-        print()
-        print("Install them with:")
-        print("    venv/bin/pip install -r requirements.txt")
-        print()
-        print("Then run the app again.")
-        sys.exit(1)
+        if missing:
+            print("=" * 72)
+            print("YT MUSIC DOWNLOADER - MISSING DEPENDENCIES")
+            print("=" * 72)
+            print()
+            print("The virtualenv is missing required packages:")
+            for module in missing:
+                print(f"    - {module}")
+            print()
+            print("Install them with:")
+            print("    venv/bin/pip install -r requirements.txt")
+            print()
+            print("Then run the app again.")
+            sys.exit(1)
 
-    install_deno(VENV_BIN)
+        install_deno(VENV_BIN)
+        return
+
+    # Frozen build: provision external binaries into DATA_DIR/bin.
+    binary_dir = runtime_bin_dir()
+    binary_dir.mkdir(parents=True, exist_ok=True)
+
+    install_bundled_deno(binary_dir)
+    install_deno(binary_dir)
+    install_yt_dlp(binary_dir)
+
+
+def bundled_asset(name: str) -> Path | None:
+    """
+    Path of a data file bundled into a frozen build (PyInstaller puts
+    datas under sys._MEIPASS), or None when running from source.
+    """
+    if not IS_FROZEN:
+        return None
+
+    base = getattr(sys, "_MEIPASS", None)
+
+    if not base:
+        return None
+
+    candidate = Path(base) / name
+
+    if candidate.exists():
+        return candidate
+
+    return None
+
+
+def install_bundled_deno(bin_dir: Path) -> None:
+    """
+    Copy the Deno binary bundled inside the frozen executable into
+    bin_dir on first run, so a cold start needs no network beyond
+    YouTube itself. Errors fall through to the download path in
+    install_deno().
+    """
+    name = "deno.exe" if os.name == "nt" else "deno"
+    source = bundled_asset(f"bin/{name}")
+
+    if source is None:
+        return
+
+    target = bin_dir / name
+
+    if target.exists():
+        return
+
+    try:
+        shutil.copy2(source, target)
+        target.chmod(
+            target.stat().st_mode
+            | stat.S_IXUSR
+            | stat.S_IXGRP
+            | stat.S_IXOTH
+        )
+        print(f"      Installed bundled Deno to {target}")
+    except Exception as error:
+        print(f"      Could not install bundled Deno: {error}")
+
+
+def install_yt_dlp(bin_dir: Path) -> None:
+    """
+    Provision the standalone yt-dlp binary for frozen builds. The
+    official standalone binaries run without a Python interpreter and
+    support yt-dlp's own --update, which the in-app updater relies on.
+    Downloaded on first run into DATA_DIR/bin.
+    """
+    if os.name == "nt":
+        name = "yt-dlp.exe"
+        asset = "yt-dlp.exe"
+    elif sys.platform == "darwin":
+        name = "yt-dlp"
+        asset = "yt-dlp_macos"
+    else:
+        name = "yt-dlp"
+        asset = "yt-dlp_linux"
+
+    target = bin_dir / name
+
+    if target.exists():
+        try:
+            subprocess.run(
+                [str(target), "--version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            return
+        except Exception:
+            target.unlink(missing_ok=True)
+
+    try:
+        api = github_json(
+            "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+        )
+    except Exception as error:
+        print(f"      Could not reach GitHub for yt-dlp: {error}")
+        return
+
+    url = None
+
+    for item in api.get("assets", []):
+        if item.get("name") == asset:
+            url = item.get("browser_download_url")
+            break
+
+    if not url:
+        print(f"      Could not find yt-dlp asset '{asset}' in the latest release.")
+        return
+
+    print(f"      Downloading {asset}...")
+    download_file(url, target)
+
+    try:
+        target.chmod(
+            target.stat().st_mode
+            | stat.S_IXUSR
+            | stat.S_IXGRP
+            | stat.S_IXOTH
+        )
+    except Exception:
+        pass
 
 
 def github_json(url: str) -> Any:
@@ -188,7 +401,9 @@ def download_file(url: str, destination: Path) -> None:
 
 
 def install_deno(bin_dir: Path) -> None:
-    deno_path = bin_dir / "deno"
+    # Filename comes from deno_binary() so Windows gets the .exe suffix
+    # everywhere (the launch path and this install path must agree).
+    deno_path = bin_dir / deno_binary().name
 
     if deno_path.exists():
         try:
@@ -262,8 +477,13 @@ def install_deno(bin_dir: Path) -> None:
             f"Could not find Deno asset '{asset}' in the latest release."
         )
 
+    # Extract next to the project (source runs) or inside the user's
+    # data dir (frozen builds, where PROJECT_DIR is an ephemeral
+    # extraction directory).
+    temporary_home = str(DATA_DIR if IS_FROZEN else PROJECT_DIR)
+
     with tempfile.TemporaryDirectory(
-        dir=str(PROJECT_DIR)
+        dir=temporary_home
     ) as temporary:
         temporary_dir = Path(temporary)
         archive = temporary_dir / asset
@@ -390,9 +610,12 @@ from textual.widgets import (
 # Paths and configuration
 # ============================================================================
 
-ACCOUNTS_DIR = PROJECT_DIR / "accounts"
-FILES_DIR = PROJECT_DIR / "files"
-CONFIG_DIR = PROJECT_DIR / "config"
+# Source runs keep data project-local; frozen builds keep it in the
+# user's home directory (see resolve_data_dir). YTM_DATA_DIR overrides
+# both.
+ACCOUNTS_DIR = DATA_DIR / "accounts"
+FILES_DIR = DATA_DIR / "files"
+CONFIG_DIR = DATA_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 
 DEFAULT_SETTINGS = {
@@ -728,9 +951,42 @@ def get_accounts() -> list[dict[str, Any]]:
     return result
 
 
+def account_creation_error(
+    error: Exception,
+    source: str | None = None,
+) -> ValueError:
+    """
+    Turn a failed account-creation attempt into an actionable message.
+
+    A session that is not signed in makes YouTube return a sign-in
+    prompt page instead of the liked-songs playlist; that surfaces as
+    a navigation KeyError whose raw text is a wall of renderer JSON.
+    Users must always see the real reason, so detect that shape and
+    say exactly what to do about it.
+    """
+    message = str(error)
+    if (
+        "twoColumnBrowseResultsRenderer" in message
+        or "singleColumnBrowseResultsRenderer" in message
+    ):
+        text = (
+            "YouTube returned a sign-in prompt instead of your library — "
+            "this session is not signed in to YouTube Music. Note that "
+            "playing music works while signed out: open "
+            "music.youtube.com, check the avatar at the top right, sign "
+            "in there (or pick a different profile), then retry."
+        )
+    else:
+        text = f"Failed to create account: {message[:400]}"
+    if source:
+        text += f" [source: {source}]"
+    return ValueError(text)
+
+
 def create_account(
     name: str,
     headers_raw: str,
+    source: str | None = None,
 ) -> dict[str, Any]:
     name = name.strip()
     headers_raw = headers_raw.strip()
@@ -781,9 +1037,7 @@ def create_account(
 
         from ytmusicapi import YTMusic
 
-        ytm = YTMusic(
-            str(auth_file)
-        )
+        ytm = build_ytmusic_client(auth_file)
 
         data = ytm.get_liked_songs(10000)
 
@@ -826,12 +1080,107 @@ def create_account(
             "track_count": len(tracks),
         }
 
-    except Exception:
+    except Exception as error:
         shutil.rmtree(
             directory,
             ignore_errors=True,
         )
-        raise
+        raise account_creation_error(
+            error,
+            source,
+        ) from error
+
+
+
+def build_ytmusic_client(auth_path: Any) -> Any:
+    """
+    Construct a YTMusic client from an account auth file.
+
+    Accounts store browser request headers — either pasted manually
+    from DevTools or imported automatically from the user's browser
+    cookie store. Both load as plain header-based auth.
+    """
+    from ytmusicapi import YTMusic
+
+    return YTMusic(
+        str(
+            Path(auth_path)
+        )
+    )
+
+
+def list_importable_browsers() -> list[dict[str, Any]]:
+    """
+    Detect which installed browsers can automatically supply their
+    YouTube sign-in cookies for account creation.
+    """
+    import browsercookies
+
+    return browsercookies.list_browsers()
+
+
+def import_account_from_browser(
+    name: str,
+    browser: str,
+    profile: str | None = None,
+) -> dict[str, Any]:
+    """
+    Create an account by importing the signed-in youtube.com cookies
+    from the user's own browser — the automatic equivalent of the
+    manual "copy request headers" paste.
+
+    This replaces Google OAuth sign-in: Google blocks third-party
+    OAuth apps from reading a YouTube Music library (youtubei rejects
+    every third-party OAuth token, and the official Data API needs a
+    user-owned cloud project), so browser cookies are the reliable
+    automatic path.
+    """
+    import browsercookies
+
+    # Resolve auto-detection here (not inside header building) so the
+    # account's error messages can say which profile was actually
+    # used. Validation against YouTube happens inside auto_profile().
+    resolved = (profile or "").strip() or None
+    if resolved is None and browser != "firefox":
+        resolved = browsercookies.auto_profile(browser)
+
+    headers_raw = browsercookies.headers_raw_for(
+        browser,
+        resolved,
+    )
+
+    source = str(browser)
+    if resolved:
+        source += f" profile {resolved!r}"
+
+    # Presence check before committing to the import: an expired or
+    # signed-out session makes YouTube serve a sign-in prompt, and the
+    # failure is easy to misread because YouTube Music playback works
+    # while signed out. header_is_live() returning None (offline, no
+    # marker) never blocks — create_account reports real reasons.
+    cookie_line = next(
+        (
+            line[len("cookie: ") :]
+            for line in headers_raw.splitlines()
+            if line.lower().startswith("cookie: ")
+        ),
+        "",
+    )
+    if cookie_line and browsercookies.header_is_live(cookie_line) is False:
+        raise ValueError(
+            f"{source} has valid cookie data, but YouTube reports that "
+            "Google session as signed out. Playing music on YouTube "
+            "Music works while signed out, so open music.youtube.com "
+            "in that browser, confirm the avatar at the top right "
+            "(sign in if prompted), then retry."
+        )
+
+    return create_account(
+        name,
+        headers_raw,
+        source=source,
+    )
+
 
 
 def save_account_metadata(
@@ -1026,9 +1375,7 @@ def fetch_all_liked_tracks(
 ) -> list[dict[str, Any]]:
     from ytmusicapi import YTMusic
 
-    ytm = YTMusic(
-        str(account["auth"])
-    )
+    ytm = build_ytmusic_client(account["auth"])
 
     # Request a deliberately large limit. ytmusicapi returns the
     # complete available liked-music library rather than restricting
@@ -1056,9 +1403,7 @@ def fetch_most_played(
     """
     from ytmusicapi import YTMusic
 
-    ytm = YTMusic(
-        str(account["auth"])
-    )
+    ytm = build_ytmusic_client(account["auth"])
 
     history = ytm.get_history()
 
@@ -1174,9 +1519,7 @@ def search_tracks(
     from ytmusicapi import YTMusic
 
     if account is not None:
-        ytm = YTMusic(
-            str(account["auth"])
-        )
+        ytm = build_ytmusic_client(account["auth"])
     else:
         ytm = YTMusic()
 
@@ -1215,9 +1558,7 @@ def fetch_library_playlists(
     """
     from ytmusicapi import YTMusic
 
-    ytm = YTMusic(
-        str(account["auth"])
-    )
+    ytm = build_ytmusic_client(account["auth"])
 
     playlists = ytm.get_library_playlists(
         100
@@ -1276,9 +1617,7 @@ def fetch_playlist_tracks(
     """
     from ytmusicapi import YTMusic
 
-    ytm = YTMusic(
-        str(account["auth"])
-    )
+    ytm = build_ytmusic_client(account["auth"])
 
     tracks = []
     continuation = None
@@ -1450,9 +1789,7 @@ def probe_auth(
     try:
         from ytmusicapi import YTMusic
 
-        ytm = YTMusic(
-            str(account["auth"])
-        )
+        ytm = build_ytmusic_client(account["auth"])
         ytm.get_library_playlists(
             1
         )
@@ -3031,9 +3368,7 @@ def remove_duplicates_from_account(
 
     video_ids = sorted(set(video_ids))
 
-    ytm = YTMusic(
-        str(account["auth"])
-    )
+    ytm = build_ytmusic_client(account["auth"])
 
     attempts: list[str] = []
     errors: dict[str, str] = {}
@@ -3532,7 +3867,7 @@ def check_yt_dlp_update() -> dict[str, Any]:
     Returns current/latest versions and whether an update is due.
     """
     current = "unknown"
-    binary = VENV_BIN / "yt-dlp"
+    binary = yt_dlp_binary()
 
     try:
         result = subprocess.run(
@@ -3582,9 +3917,10 @@ def check_yt_dlp_update() -> dict[str, Any]:
 
 def update_yt_dlp() -> dict[str, Any]:
     """
-    Self-update the venv's yt-dlp binary in place.
+    Self-update the yt-dlp binary in place (the venv's copy in source
+    runs, DATA_DIR/bin's copy in frozen builds).
     """
-    binary = VENV_BIN / "yt-dlp"
+    binary = yt_dlp_binary()
 
     try:
         result = subprocess.run(
@@ -3971,7 +4307,169 @@ PREMIUM_BLOCK_REASON = "premium"
 def is_premium_failure(reason: str) -> bool:
     """True when a yt-dlp failure means the video is behind the YouTube
     Music Premium wall (not just a transient error)."""
-    return "premium" in (reason or "").lower()
+    if not reason:
+        return False
+    r = reason.lower()
+    return (
+        "premium" in r
+        or "members only" in r
+        or "music premium" in r
+        or "youtube premium" in r
+        or "join youtube premium" in r
+        or "requires a subscription" in r
+        or "subscription" in r
+        or "requires subscription" in r
+        or "subscription required" in r
+        or "age-restricted" in r
+        or "age restricted" in r
+        or "sign in" in r
+        or "not available on this account" in r
+        or "this video is unavailable" in r
+    )
+
+
+def is_cookieless_403_failure(reason: str) -> bool:
+    """True when a yt-dlp failure is the signed-out CDN cap.
+
+    Signed-out sessions (an auth file without valid YouTube cookies
+    leaves yt-dlp unauthenticated) may only fetch the first ~1 MB of
+    a stream URL; YouTube's GVS PO-token experiment refuses larger or
+    mid-file ranges with HTTP 403. Cookie sessions mint unrestricted
+    URLs and never hit this.
+    """
+    if not reason:
+        return False
+    r = reason.lower()
+    return (
+        ("403" in r or "forbidden" in r)
+        and not is_premium_failure(r)
+    )
+
+
+COOKIELESS_403_HINT = (
+    "YouTube only serves the first ~1 MB of a stream to signed-out "
+    "sessions, and this account's stored sign-in has no valid YouTube "
+    "cookies. Re-add the account with \"Import sign-in from browser\" "
+    "or by pasting browser request headers to download full tracks."
+)
+
+
+_YTDLP_FORWARDED_HEADERS = (
+    "user-agent",
+    "authorization",
+    "x-goog-authuser",
+    "x-goog-visitor-id",
+    "x-origin",
+    "referer",
+    "origin",
+)
+
+
+def _read_auth_headers(auth_path: Path) -> dict[str, str]:
+    """Return the lowercase header map stored in a ytmusicapi auth file
+    (accounts/<slug>/.headers_auth.json), or {} when unreadable."""
+    try:
+        if not auth_path or not auth_path.exists():
+            return {}
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+
+        # OAuth device-flow accounts store a RefreshingToken JSON here
+        # instead of browser headers. Token fields are not HTTP headers —
+        # never forward them (or leak access/refresh tokens) to yt-dlp.
+        try:
+            from ytmusicapi.auth.oauth.token import Token
+
+            is_oauth_token = all(
+                key in data for key in Token.members()
+            )
+        except Exception:
+            is_oauth_token = False
+
+        if is_oauth_token:
+            return {}
+        headers = data.get("headers") or data.get("request_headers")
+        if isinstance(headers, str):
+            parsed = {}
+            for line in headers.splitlines():
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                parsed[key.strip().lower()] = value.strip()
+            return parsed
+        if isinstance(headers, dict):
+            return {str(k).lower(): str(v) for k, v in headers.items()}
+        # Flat dict of headers (current ytmusicapi format).
+        return {str(k).lower(): str(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def _write_netscape_cookies(cookie_header: str, path: Path) -> bool:
+    """Convert a `name=value; name2=value2` Cookie header into a
+    Netscape cookies.txt file yt-dlp can consume. Returns success."""
+    try:
+        pairs = []
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if name:
+                pairs.append((name, value.strip()))
+        if not pairs:
+            return False
+        expires = 2147483647
+        lines = ["# Netscape HTTP Cookie File", ""]
+        for name, value in pairs:
+            for domain in (".youtube.com", ".google.com"):
+                lines.append(
+                    f"{domain}\tTRUE\t/\tTRUE\t{expires}\t{name}\t{value}"
+                )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _yt_dlp_auth_args(
+    auth_path: Path,
+    cookie_file: Path,
+) -> list[str]:
+    """Build yt-dlp auth arguments from the account's auth file.
+
+    Prefers a Netscape cookie file (yt-dlp's own cookie jar) and forwards
+    the remaining identifying headers. Never logs secret values.
+    """
+    headers = _read_auth_headers(auth_path)
+    args: list[str] = []
+
+    cookie_header = headers.get("cookie", "")
+    if cookie_header and _write_netscape_cookies(cookie_header, cookie_file):
+        args.extend(["--cookies", str(cookie_file)])
+
+    for key in _YTDLP_FORWARDED_HEADERS:
+        value = headers.get(key)
+        if not value:
+            continue
+        if key == "user-agent":
+            args.extend(["--user-agent", value])
+        else:
+            title = "-".join(part.capitalize() for part in key.split("-"))
+            args.extend(["--add-header", f"{title}: {value}"])
+
+    if "referer" not in headers:
+        args.extend(["--add-header", "Referer: https://music.youtube.com/"])
+    if "origin" not in headers:
+        args.extend(["--add-header", "Origin: https://music.youtube.com"])
+
+    return args
 
 
 def is_premium_blocked(record: dict[str, Any]) -> bool:
@@ -4239,6 +4737,24 @@ class DownloadWorker:
 
         total = len(self.tracks)
 
+        # Build yt-dlp auth arguments once per stage. The auth file holds
+        # the same cookies/session the ytmusicapi client uses, so yt-dlp
+        # must send them too or YouTube returns 403/sign-in errors.
+        cookie_fd, cookie_name = tempfile.mkstemp(
+            prefix=".ytm_ytdl_cookies_",
+            suffix=".txt",
+        )
+        os.close(cookie_fd)
+        cookie_file = Path(cookie_name)
+        auth_args = _yt_dlp_auth_args(
+            Path(self.account.get("auth", "")),
+            cookie_file,
+        )
+        # yt-dlp authenticates with cookies only; an OAuth account has a
+        # token file, so its downloads run signed-out and can hit the
+        # ~1 MB CDN cap (see is_cookieless_403_failure).
+        has_cookies = "--cookies" in auth_args
+
         def download_one(
             number: int,
             track: dict[str, Any],
@@ -4384,11 +4900,11 @@ class DownloadWorker:
             )
 
             yt_dlp = (
-                VENV_BIN / "yt-dlp"
+                yt_dlp_binary()
             )
 
             deno = (
-                VENV_BIN / "deno"
+                deno_binary()
             )
 
             ffmpeg = Path(
@@ -4431,9 +4947,22 @@ class DownloadWorker:
 
                 "--output",
                 str(temporary_template),
-
-                url,
             ]
+
+            # Send the account's cookies/session so YouTube does not
+            # reject the request as signed-out/unauthenticated.
+            command.extend(auth_args)
+            # The web_music player client only serves full formats to a
+            # signed-in session (cookie jar); without cookies it returns
+            # UNPLAYABLE/format-18-only. OAuth accounts store a token,
+            # not cookies, so they fall back to yt-dlp's default client,
+            # which works for signed-out playback.
+            if "--cookies" in auth_args:
+                command.extend([
+                    "--extractor-args",
+                    "youtube:player_client=web_music",
+                ])
+            command.append(url)
 
             if config["audio_quality"] is not None:
                 command.extend(
@@ -4502,6 +5031,7 @@ class DownloadWorker:
                         stderr=subprocess.STDOUT,
                         text=True,
                         bufsize=1,
+                        cwd=str(Path.cwd()),
                     )
 
                     assert process.stdout is not None
@@ -4511,7 +5041,18 @@ class DownloadWorker:
                         "",
                     ):
                         if self.cancelled:
-                            process.terminate()
+                            try:
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                    try:
+                                        process.wait(timeout=5)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                             break
 
                         line = line.strip()
@@ -4535,22 +5076,47 @@ class DownloadWorker:
                             except ValueError:
                                 pass
 
+                        l = line
+                        low = str(l).lower()
                         if (
-                            "ERROR:" in line
-                            or "HTTP Error" in line
-                            or "has been removed" in line
-                            or "not available" in line
-                            or "Sign in" in line
+                            "error:" in low
+                            or "http error" in low
+                            or "has been removed" in low
+                            or "not available" in low
+                            or "sign in" in low
+                            or "members only" in low
+                            or "music premium" in low
+                            or "youtube premium" in low
+                            or "premium" in low
+                            or "age-restricted" in low
+                            or "age restricted" in low
+                            or "private video" in low
+                            or "unavailable" in low
+                            or ("requires" in low and ("login" in low or "sign in" in low or "subscription" in low))
+                            or "403" in low or "401" in low
                         ):
-                            last_error = line
+                            if last_error == "Unknown download error.":
+                                last_error = str(l)
+                            else:
+                                if len(last_error) < 200:
+                                    last_error = last_error + " | " + str(l)
+                                else:
+                                    last_error = str(l)
 
                         self.emit(
                             "log",
                             text=line,
                         )
 
-                    return_code = process.wait()
-
+                    try:
+                        return_code = process.wait(timeout=300)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        try:
+                            process.wait(timeout=10)
+                        except Exception:
+                            pass
+                        return_code = -1
                     if (
                         return_code == 0
                         and not self.cancelled
@@ -4598,12 +5164,17 @@ class DownloadWorker:
             if not success or not candidates:
                 reason = (
                     last_error
-                    if last_error
+                    if last_error and last_error != "Unknown download error."
                     else (
                         "yt-dlp failed to produce "
                         "the requested audio."
                     )
                 )
+
+                if not has_cookies and is_cookieless_403_failure(
+                    reason
+                ):
+                    reason = f"{reason} — {COOKIELESS_403_HINT}"
 
                 with self._io_lock:
                     self.failed += 1
@@ -4751,52 +5322,66 @@ class DownloadWorker:
             ),
         )
 
-        if max_parallel <= 1:
-            for number, track in enumerate(
-                self.tracks,
-                1,
-            ):
-                if self.cancelled:
-                    break
-                download_one(
-                    number,
-                    track,
-                )
-        else:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(
-                max_workers=max_parallel,
-            ) as pool:
-                pending = []
-
+        try:
+            if max_parallel <= 1:
                 for number, track in enumerate(
                     self.tracks,
                     1,
                 ):
                     if self.cancelled:
                         break
-                    pending.append(
-                        pool.submit(
-                            download_one,
-                            number,
-                            track,
-                        )
+                    download_one(
+                        number,
+                        track,
                     )
+            else:
+                from concurrent.futures import ThreadPoolExecutor
 
-                for future in pending:
-                    try:
-                        future.result()
-                    except Exception as error:
-                        self.emit(
-                            "log",
-                            text=f"Download error: {error}",
+                with ThreadPoolExecutor(
+                    max_workers=max_parallel,
+                ) as pool:
+                    pending = []
+
+                    for number, track in enumerate(
+                        self.tracks,
+                        1,
+                    ):
+                        if self.cancelled:
+                            break
+                        pending.append(
+                            pool.submit(
+                                download_one,
+                                number,
+                                track,
+                            )
                         )
 
-        save_inventory(
-            self.account,
-            inventory,
-        )
+                    for future in pending:
+                        try:
+                            future.result()
+                        except Exception as error:
+                            # Record failure for this task
+                            msg = str(error)
+                            self.emit(
+                                "log",
+                                text=f"Download error: {msg}",
+                            )
+                            with self._io_lock:
+                                self.failed += 1
+                            self.emit("status", text=f"✗ FAILED — {msg}")
+                            self.counts()
+        finally:
+            save_inventory(
+                self.account,
+                inventory,
+            )
+
+            # Remove the transient cookie file holding the account session.
+            try:
+                if cookie_file.exists():
+                    cookie_file.unlink()
+            except OSError:
+                pass
 
 
 # ============================================================================
@@ -4853,6 +5438,16 @@ class AddAccountScreen(ModalScreen):
     """
 
     def compose(self) -> ComposeResult:
+        browsers = list_importable_browsers()
+        self._browsers = browsers
+        default_browser = next(
+            (
+                entry["id"]
+                for entry in browsers
+                if entry.get("available")
+            ),
+            None,
+        )
         yield Container(
             Label(
                 "ADD YOUTUBE MUSIC ACCOUNT",
@@ -4860,13 +5455,17 @@ class AddAccountScreen(ModalScreen):
             ),
 
             Static(
-                "1. Log into the desired YouTube Music account.\n"
-                "2. Open YouTube Music in Firefox/Chrome.\n"
-                "3. Open Developer Tools → Network.\n"
-                "4. Find a POST request to /browse with status 200.\n"
-                "5. Right-click → Copy → Copy request headers.\n"
-                "6. Paste the complete request headers below.\n\n"
-                "The headers are stored locally as a protected "
+                "Automatic (recommended):\n"
+                "1. Sign into YouTube Music in your browser.\n"
+                "2. Pick that browser (and profile) below —\n"
+                '   "Auto-detect" finds the signed-in one.\n'
+                "3. Click \"Import sign-in from browser\".\n\n"
+                "Manual fallback:\n"
+                "1. Open YouTube Music, open Developer Tools → Network.\n"
+                "2. Find a POST request to /browse with status 200.\n"
+                "3. Right-click → Copy → Copy request headers.\n"
+                "4. Paste the complete request headers below.\n\n"
+                "Authentication is stored locally as a protected "
                 ".headers_auth.json file.",
                 id="instructions",
             ),
@@ -4878,8 +5477,39 @@ class AddAccountScreen(ModalScreen):
 
             TextArea(
                 "",
-                placeholder="Paste request headers here...",
+                placeholder="Paste request headers here (manual fallback)...",
                 id="headers",
+            ),
+
+            Select(
+                [
+                    (
+                        entry["label"]
+                        + (
+                            ""
+                            if entry["available"]
+                            else " (not installed)"
+                        ),
+                        entry["id"],
+                    )
+                    for entry in browsers
+                ],
+                value=(
+                    default_browser
+                    if default_browser is not None
+                    else Select.BLANK
+                ),
+                allow_blank=True,
+                prompt="Import sign-in from browser...",
+                id="browser",
+            ),
+
+            Select(
+                self._profile_options(default_browser),
+                value="auto",
+                allow_blank=False,
+                prompt="Profile...",
+                id="profile",
             ),
 
             Label(
@@ -4900,6 +5530,11 @@ class AddAccountScreen(ModalScreen):
                 ),
 
                 Button(
+                    "Import sign-in from browser",
+                    id="add-browser",
+                ),
+
+                Button(
                     "Cancel",
                     id="cancel",
                 ),
@@ -4909,6 +5544,57 @@ class AddAccountScreen(ModalScreen):
 
             id="modal",
         )
+
+    def _profile_options(
+        self,
+        browser_id: str | None,
+    ) -> list[tuple[str, str]]:
+        """Profile choices for one browser: auto-detect first, then
+        every profile with an honest offline session hint."""
+        options: list[tuple[str, str]] = [
+            ("Auto-detect (recommended)", "auto"),
+        ]
+        entry = next(
+            (
+                candidate
+                for candidate in getattr(self, "_browsers", [])
+                if browser_id
+                and candidate["id"] == browser_id
+                and candidate.get("available")
+            ),
+            None,
+        )
+        for profile_entry in (entry or {}).get("profiles", []):
+            display = profile_entry.get("name") or profile_entry["id"]
+            label = f"{display} ({profile_entry['id']})"
+            session = profile_entry.get("session")
+            if session is True:
+                label += " · session cookies present"
+            elif session is False:
+                label += " · no Google session"
+            options.append((label, profile_entry["id"]))
+        return options
+
+    def on_select_changed(
+        self,
+        event: Select.Changed,
+    ) -> None:
+        if event.select.id != "browser":
+            return
+
+        browser_id = (
+            None
+            if event.value is Select.BLANK
+            else str(event.value)
+        )
+        profile_select = self.query_one(
+            "#profile",
+            Select,
+        )
+        profile_select.set_options(
+            self._profile_options(browser_id)
+        )
+        profile_select.value = "auto"
 
     def on_button_pressed(
         self,
@@ -4931,6 +5617,69 @@ class AddAccountScreen(ModalScreen):
             ).update(
                 "YouTube Music opened."
             )
+
+            return
+
+        if button == "add-browser":
+            import_name = self.query_one(
+                "#name",
+                Input,
+            ).value.strip()
+
+            if not import_name:
+                self.query_one(
+                    "#status",
+                    Label,
+                ).update(
+                    "ERROR: Enter an account name."
+                )
+                return
+
+            browser_select = self.query_one(
+                "#browser",
+                Select,
+            )
+
+            browser_id = browser_select.value
+
+            if browser_id is Select.BLANK:
+                self.query_one(
+                    "#status",
+                    Label,
+                ).update(
+                    "ERROR: Choose which browser to import from."
+                )
+                return
+
+            profile_value = self.query_one(
+                "#profile",
+                Select,
+            ).value
+            profile = (
+                None
+                if profile_value is Select.BLANK
+                or str(profile_value) == "auto"
+                else str(profile_value)
+            )
+
+            event.button.disabled = True
+
+            self.query_one(
+                "#status",
+                Label,
+            ).update(
+                "Importing the browser's YouTube sign-in..."
+            )
+
+            threading.Thread(
+                target=self.import_worker,
+                args=(
+                    import_name,
+                    str(browser_id),
+                    profile,
+                ),
+                daemon=True,
+            ).start()
 
             return
 
@@ -5003,6 +5752,41 @@ class AddAccountScreen(ModalScreen):
                 str(error),
             )
 
+    def import_worker(
+        self,
+        name: str,
+        browser: str,
+        profile: str | None = None,
+    ) -> None:
+        try:
+            account = import_account_from_browser(
+                name,
+                browser,
+                profile,
+            )
+
+            self.app.call_from_thread(
+                self.success,
+                account,
+            )
+
+        except Exception as error:
+            self.app.call_from_thread(
+                self.failure,
+                str(error),
+            )
+
+    def update_status(
+        self,
+        message: str,
+    ) -> None:
+        self.query_one(
+            "#status",
+            Label,
+        ).update(
+            message
+        )
+
     def success(
         self,
         account: dict[str, Any],
@@ -5015,6 +5799,11 @@ class AddAccountScreen(ModalScreen):
     ) -> None:
         self.query_one(
             "#add",
+            Button,
+        ).disabled = False
+
+        self.query_one(
+            "#add-browser",
             Button,
         ).disabled = False
 
@@ -5252,11 +6041,14 @@ class DownloadOptionsScreen(ModalScreen):
         )
 
         # Persist only as the next-session default.
-        settings = self.app.settings
-        settings["default_quality"] = session.quality
-        settings["default_existing_policy"] = session.existing_policy
-        settings["default_session"] = session.session
-        save_settings(settings)
+        try:
+            settings = self.app.settings
+            settings["default_quality"] = session.quality
+            settings["default_existing_policy"] = session.existing_policy
+            settings["default_session"] = session.session
+            save_settings(settings)
+        except Exception:
+            pass
 
         self.dismiss(session)
 
@@ -5588,6 +6380,206 @@ class MostPlayedScreen(ModalScreen):
                 "session": session,
             }
         )
+
+
+# ============================================================================
+# Listening stats modal (local play log — parity with the web insights view)
+# ============================================================================
+
+def compute_play_stats() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Aggregate files/<slug>/.plays.json for the TUI.
+
+    Returns (play_stats, history_stats) — the same local data the web
+    insights view shows, read directly without starting the web server.
+    """
+    module = sys.modules[__name__]
+    from web import plays as plays_module
+
+    return (
+        plays_module.play_stats(module),
+        plays_module.history_stats(module, None, 90),
+    )
+
+
+class PlayStatsScreen(ModalScreen):
+    CSS = """
+    PlayStatsScreen {
+        align: center middle;
+    }
+
+    #modal {
+        width: 88%;
+        height: 86%;
+        background: $surface;
+        border: double $primary;
+        padding: 2;
+    }
+
+    #title {
+        color: $accent;
+        text-style: bold;
+        padding-bottom: 1;
+    }
+
+    #summary {
+        height: auto;
+        padding-bottom: 1;
+    }
+
+    #stats-content {
+        height: 1fr;
+        overflow-y: auto;
+        border: solid $secondary;
+        padding: 1;
+    }
+
+    #buttons {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #buttons Button {
+        margin-right: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        stats: dict[str, Any],
+        history: dict[str, Any],
+    ) -> None:
+        super().__init__()
+
+        self.stats = stats
+        self.history = history
+
+    def render_summary(self) -> str:
+        stats = self.stats
+        history = self.history
+
+        total = int(stats.get("total_plays", 0) or 0)
+        unique = int(stats.get("unique_tracks", 0) or 0)
+
+        parts = [
+            f"Total plays: {total}",
+            f"Unique tracks: {unique}",
+        ]
+
+        streaks = history.get("streaks") or {}
+        current = int(streaks.get("current", 0) or 0)
+        if current:
+            best = int(streaks.get("best", 0) or 0)
+            streak = f"Streak: {current} day(s)"
+            if best > current:
+                streak += f" (best {best})"
+            parts.append(streak)
+
+        week = history.get("week") or {}
+        if "this" in week:
+            parts.append(
+                f"This week: {week.get('this', 0)} "
+                f"(prev {week.get('prev', 0)})"
+            )
+
+        return "  ·  ".join(parts)
+
+    def render_content(self) -> str:
+        stats = self.stats
+        lines: list[str] = []
+
+        per_account = stats.get("per_account") or {}
+        if per_account:
+            lines.append("PER ACCOUNT")
+            for slug, count in sorted(
+                per_account.items(),
+                key=lambda item: -item[1],
+            ):
+                lines.append(f"  {slug:<20} {count:>5} plays")
+            lines.append("")
+
+        lines.append("TOP TRACKS (local plays)")
+        top_tracks = stats.get("top_tracks") or []
+        if top_tracks:
+            for index, item in enumerate(top_tracks[:15], 1):
+                plays = int(item.get("plays", 0) or 0)
+                title = item.get("title") or item.get("id", "?")
+                artist = item.get("artist") or ""
+                lines.append(
+                    f"  #{index:<3}{plays:>5}  {title} — {artist}"
+                )
+        else:
+            lines.append(
+                "  No plays recorded yet — play tracks in the web UI "
+                "and they will show up here."
+            )
+
+        top_artists = stats.get("top_artists") or []
+        if top_artists:
+            lines.append("")
+            lines.append("TOP ARTISTS")
+            for index, item in enumerate(top_artists[:8], 1):
+                plays = int(item.get("plays", 0) or 0)
+                lines.append(
+                    f"  #{index:<3}{plays:>5}  "
+                    f"{item.get('artist', '?')}"
+                )
+
+        return "\n".join(lines)
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Label("LISTENING STATS", id="title"),
+            Static(
+                self.render_summary(),
+                id="summary",
+            ),
+            Static(
+                self.render_content(),
+                id="stats-content",
+            ),
+            Horizontal(
+                Button(
+                    "Refresh",
+                    id="refresh",
+                ),
+                Button(
+                    "Close",
+                    id="close",
+                ),
+                id="buttons",
+            ),
+            id="modal",
+        )
+
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ) -> None:
+        if event.button.id == "close":
+            self.dismiss(None)
+            return
+
+        if event.button.id == "refresh":
+            try:
+                stats, history = compute_play_stats()
+            except Exception as error:
+                self.app.notify(
+                    f"Could not reload listening stats: {error}",
+                    severity="error",
+                )
+                return
+            self.stats = stats
+            self.history = history
+            self.query_one("#summary", Static).update(
+                self.render_summary(),
+            )
+            self.query_one("#stats-content", Static).update(
+                self.render_content(),
+            )
+            self.app.notify(
+                "Listening stats reloaded.",
+                severity="information",
+            )
 
 
 # ============================================================================
@@ -7151,19 +8143,25 @@ class SettingsScreen(ModalScreen):
             )
             return
 
-        settings = {
-            "default_quality": str(quality),
-            "default_existing_policy": str(policy),
-            "default_session": str(
-                self.query_one(
-                    "#default-session",
-                    Select,
-                ).value
-            ),
-            "default_limit": default_limit,
-            "retry_attempts": retry_attempts,
-            "retry_delay": retry_delay,
-        }
+        # Merge over the settings currently on disk (reloaded fresh) —
+        # writing only the six keys this modal edits would wipe every
+        # other persisted key (last.fm, automation, rate limit, ...).
+        settings = load_settings()
+        settings.update(
+            {
+                "default_quality": str(quality),
+                "default_existing_policy": str(policy),
+                "default_session": str(
+                    self.query_one(
+                        "#default-session",
+                        Select,
+                    ).value
+                ),
+                "default_limit": default_limit,
+                "retry_attempts": retry_attempts,
+                "retry_delay": retry_delay,
+            }
+        )
 
         save_settings(settings)
         self.dismiss(settings)
@@ -7533,6 +8531,7 @@ class YTMusicDownloader(App):
         ("u", "duplicates", "Duplicates"),
         ("r", "refresh", "Refresh"),
         ("s", "status", "Library Status"),
+        ("h", "play_stats", "Play Stats"),
         ("p", "settings", "Settings"),
         ("delete", "delete_account", "Remove"),
         ("q", "quit", "Quit"),
@@ -7694,8 +8693,8 @@ class YTMusicDownloader(App):
     def on_mount(self) -> None:
         self.environment = {
             "python": VENV_PYTHON,
-            "yt_dlp": VENV_BIN / "yt-dlp",
-            "deno": VENV_BIN / "deno",
+            "yt_dlp": yt_dlp_binary(),
+            "deno": deno_binary(),
             "ffmpeg": Path(
                 imageio_ffmpeg.get_ffmpeg_exe()
             ),
@@ -8326,6 +9325,26 @@ class YTMusicDownloader(App):
             selected,
             session,
             output_dir=output_dir,
+        )
+
+    def action_play_stats(self) -> None:
+        """Open the local listening-stats modal (parity with the web
+        insights view). Failures surface the real reason instead of a
+        generic crash."""
+        try:
+            stats, history = compute_play_stats()
+        except Exception as error:
+            self.notify(
+                f"Could not build listening stats: {error}",
+                severity="error",
+            )
+            return
+
+        self.push_screen(
+            PlayStatsScreen(
+                stats,
+                history,
+            )
         )
 
     def action_duplicates(self) -> None:
@@ -8991,9 +10010,6 @@ class YTMusicDownloader(App):
         elif button == "remove-account":
             self.action_delete_account()
 
-        elif button == "refresh":
-            self.action_refresh()
-
         elif button == "download":
             self.action_download()
 
@@ -9021,14 +10037,22 @@ def print_help() -> None:
     print()
     print("Usage:")
     print("    ./run.sh                 Start the TUI")
+    print("    ./run.sh --tui           Start the TUI")
+    print("    ./run.sh --web           Start the web UI and open a browser")
     print("    ./run.sh --version       Print version info")
     print("    ./run.sh --help          Show this help")
     print("    ./run.sh serve           Start the local Spotify-style web UI")
     print()
     print("Serve options:")
+    print("    --lan          Share on your network (play on your phone/other device)")
     print("    --host HOST    Bind address (default 127.0.0.1)")
     print("    --port PORT    Port (default 8765)")
     print("    --token TOKEN  Require this token for LAN/remote access")
+    print("    --open         Open the web UI in your default browser")
+    print()
+    print("Play on another device (same Wi-Fi):")
+    print("    ./run.sh serve --lan")
+    print("    Then open the printed 'Network' URL on your phone.")
     print()
     print("First-time setup:")
     print("    ./install.sh             Create ./venv and install everything")
@@ -9038,6 +10062,149 @@ def print_help() -> None:
     print("    accounts/<slug>/         Per-account data and authentication")
     print("    files/<slug>/            Downloaded music and per-track inventory")
     print()
+    if IS_FROZEN:
+        print("Standalone build data directory:")
+        print(f"    {DATA_DIR}")
+        print()
+
+
+def start_web_ui(
+    host: str,
+    port: int,
+    token: str | None,
+    open_browser: bool,
+) -> None:
+    from web.server import run_server
+
+    if host not in {"127.0.0.1", "localhost", "::1"} and not token:
+        print(
+            "Binding to a non-loopback address requires --token. "
+            "Refusing to start."
+        )
+        sys.exit(1)
+
+    try:
+        run_server(
+            sys.modules[__name__],
+            host=host,
+            port=port,
+            token=token,
+            open_browser=open_browser,
+        )
+    except OSError as error:
+        # A double-clicked launcher must not dump a traceback when
+        # another instance already holds the port.
+        if error.errno in {98, 48, 10048}:  # EADDRINUSE per platform
+            shown = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
+            print()
+            print(f"Port {port} is already in use.")
+            print()
+            print("The web UI may already be running — open this address:")
+            print(f"    http://{shown}:{port}/")
+            print()
+            print("Or start on a different port:  ./run.sh serve --lan --port 8766")
+            sys.exit(1)
+        raise
+
+
+def parse_serve_args(
+    args: list[str],
+) -> tuple[str, int, str | None, bool]:
+    """
+    Extract --host/--port/--token/--open from a serve argument list.
+    """
+    host = "127.0.0.1"
+    port = 8765
+    token = None
+    open_browser = False
+
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--host" and index + 1 < len(args):
+            host = args[index + 1]
+            index += 2
+        elif arg in {"--lan", "--network"}:
+            host = "0.0.0.0"
+            index += 1
+        elif arg == "--port" and index + 1 < len(args):
+            try:
+                port = int(args[index + 1])
+            except ValueError:
+                print(f"Invalid port: {args[index + 1]}")
+                sys.exit(1)
+            index += 2
+        elif arg == "--token" and index + 1 < len(args):
+            token = args[index + 1]
+            index += 2
+        elif arg == "--open":
+            open_browser = True
+            index += 1
+        else:
+            index += 1
+
+    # Sharing on the network is only allowed with a token. When the user
+    # asks for a non-loopback bind but gives no token, generate one so the
+    # common "serve --lan" case just works (printed as part of the URL).
+    if host not in {"127.0.0.1", "localhost", "::1"} and not token:
+        token = secrets.token_urlsafe(12)
+
+    return host, port, token, open_browser
+
+
+def has_interactive_console() -> bool:
+    """
+    True when both stdin and stdout are a real terminal. A frozen
+    binary double-clicked from a file manager has no console.
+    """
+    try:
+        return bool(
+            sys.stdin is not None
+            and sys.stdin.isatty()
+            and sys.stdout is not None
+            and sys.stdout.isatty()
+        )
+    except Exception:
+        return False
+
+
+def launch_menu() -> str:
+    """
+    Simple chooser shown by standalone builds when launched from a
+    terminal. Returns "tui" or "web".
+    """
+    print()
+    print(f"  YT Music Downloader v{APP_VERSION}")
+    print()
+    print("  [1] Terminal UI (TUI)")
+    print("  [2] Web UI (opens in your browser)")
+    print("  [3] Exit")
+    print()
+
+    while True:
+        try:
+            choice = input("  Selection [1/2/3]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "web"
+
+        if choice in {"1", "tui"}:
+            return "tui"
+
+        if choice in {"2", "web"}:
+            return "web"
+
+        if choice in {"3", "q", "quit", "exit"}:
+            return "quit"
+
+        print("  Please enter 1, 2 or 3.")
+
+
+def start_tui() -> None:
+    ensure_directories()
+
+    app = YTMusicDownloader()
+    app.run()
 
 
 def main() -> None:
@@ -9053,50 +10220,53 @@ def main() -> None:
         return
 
     if args and args[0] == "serve":
-        from web.server import run_server
-
-        host = "127.0.0.1"
-        port = 8765
-        token = None
-
-        index = 0
-        while index < len(args):
-            arg = args[index]
-            if arg == "--host" and index + 1 < len(args):
-                host = args[index + 1]
-                index += 2
-            elif arg == "--port" and index + 1 < len(args):
-                try:
-                    port = int(args[index + 1])
-                except ValueError:
-                    print(f"Invalid port: {args[index + 1]}")
-                    sys.exit(1)
-                index += 2
-            elif arg == "--token" and index + 1 < len(args):
-                token = args[index + 1]
-                index += 2
-            else:
-                index += 1
-
-        if host not in {"127.0.0.1", "localhost", "::1"} and not token:
-            print(
-                "Binding to a non-loopback address requires --token. "
-                "Refusing to start."
-            )
-            sys.exit(1)
-
-        run_server(
-            sys.modules[__name__],
-            host=host,
-            port=port,
-            token=token,
-        )
+        host, port, token, open_browser = parse_serve_args(args[1:])
+        start_web_ui(host, port, token, open_browser)
         return
 
-    ensure_directories()
+    if "--web" in args:
+        host, port, token, open_browser = parse_serve_args(args)
+        # --web implies opening a browser unless --host says otherwise
+        # on a LAN address (a wildcard bind still opens the local URL).
+        start_web_ui(host, port, token, open_browser or host in {
+            "127.0.0.1", "localhost", "::1", "0.0.0.0", "::",
+        })
+        return
 
-    app = YTMusicDownloader()
-    app.run()
+    if "--tui" in args:
+        start_tui()
+        return
+
+    # No arguments.
+    if IS_FROZEN:
+        ensure_directories()
+
+        if not has_interactive_console():
+            # Double-clicked with no terminal: the web UI is the only
+            # surface that works without one, so start it and open the
+            # user's browser.
+            print(f"YT Music Downloader v{APP_VERSION}")
+            print()
+            print("No terminal detected — starting the web UI.")
+            print(f"Data directory: {DATA_DIR}")
+            print()
+            start_web_ui("127.0.0.1", 8765, None, True)
+            return
+
+        mode = launch_menu()
+
+        if mode == "quit":
+            return
+
+        if mode == "web":
+            start_web_ui("127.0.0.1", 8765, None, True)
+            return
+
+        start_tui()
+        return
+
+    # Source runs keep the historical default: straight into the TUI.
+    start_tui()
 
 
 if __name__ == "__main__":

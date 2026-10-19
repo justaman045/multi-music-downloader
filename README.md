@@ -16,8 +16,11 @@ challenges), and FFmpeg. No system-wide installs are required.
 - **Multiple accounts** — one sidebar, switch between them freely.
 - **Full liked library** — fetches the *complete* Liked Music playlist, not
   just the first page.
-- **Authentication from browser headers** — paste a request copied from your
-  browser's Developer Tools; no OAuth dance.
+- **Authentication from your own browser, automatically *or* pasted
+  headers** — the app reads your signed-in youtube.com cookies straight
+  out of Chrome/Firefox/Edge/Brave/Opera/Vivaldi (**Import sign-in**,
+  no pasting or Google setup needed), or paste a request copied from
+  your browser's Developer Tools.
 - **8 quality options**, chosen per download session:
   `best`, `MP3 320`, `MP3 V0`, `MP3 256`, `MP3 192`, `MP3 128`, `FLAC`, `M4A 256`.
 - **Immutable session settings** — the quality/policy you pick stays fixed for
@@ -50,6 +53,28 @@ challenges), and FFmpeg. No system-wide installs are required.
   premium-gated downloads, and periodic backups.
 - **Backups** — one-click zip backups of settings, accounts, and inventory,
   with on-demand restore and pruning.
+- **Smart views** — saveable filter rules for the library (download status,
+  account, play-count ranges, recently added, sort + limit), with built-in
+  views like "Missing", "Premium", and "Most played"; stored in your browser.
+- **Tag editor** — edit title/artist/album/artwork on any downloaded file
+  from the song list (`✎`), written straight into the audio tags.
+- **Download queue & scheduling** — line up tracks with the **+Q** row
+  button, then start the whole queue in one batch with your chosen
+  quality/policy; an auto-start toggle picks up the next batch whenever a
+  session slot frees up. The Downloads view also shows every scheduled
+  background task with one-click **Run now**.
+- **Export & sync** — export the library as M3U/CSV/JSON, or mirror
+  downloaded files into any target folder (hardlinks when possible, copy
+  otherwise — idempotent and safe to re-run).
+- **Listening insights** — play streaks, week-over-week comparison,
+  hour-of-day and per-day charts, top tracks/artists, and a last.fm panel
+  with manual flush, all computed from your local play log.
+- **Works on phones** — the web UI is responsive: off-canvas navigation,
+  simplified tables, and touch-friendly controls below 900px.
+- **Play on another device** — `./run.sh serve --lan` shares the player on
+  your local network with an auto-generated token; open the printed link on
+  your phone and it signs in automatically (works on your TV, tablet, or a
+  second computer on the same Wi-Fi).
 
 ---
 
@@ -65,6 +90,55 @@ No global FFmpeg, Deno, or system packages are required.
 ---
 
 ## Quick start
+
+### Standalone (no install required)
+
+Download the build for your OS from the **Releases** page and double-click it:
+
+| Platform | File |
+|---|---|
+| Windows | `YTMusicDownloader-windows-x64.exe` |
+| Linux | `YTMusicDownloader-linux-x64` |
+| macOS (Apple Silicon) | `YTMusicDownloader-macos-arm64` |
+| macOS (Intel) | `YTMusicDownloader-macos-x64` |
+
+The [Releases page](../../releases) carries two kinds of builds — **tagged
+releases** (`v6.x.y`, stable) and the
+[`latest-build` prerelease](../../releases/tag/latest-build), which CI
+rebuilds and republishes on **every push to `main`** with the same four
+files. Download links never change, so you can always grab the newest build
+from one place.
+
+- **Windows:** double-click the `.exe` → a console window opens with a menu. If Windows SmartScreen shows "Microsoft Defender SmartScreen prevented an unrecognized app from starting", click **More info** → **Run anyway** (this is normal for unsigned builds).
+- **Linux / macOS:** double-clicking a bare binary opens no terminal, so it
+  starts the **web UI** and opens your browser automatically. If your file manager doesn't allow double-click to execute, run it from a terminal: `./YTMusicDownloader-linux-x64` or `./YTMusicDownloader-macos-*`. 
+- **macOS Gatekeeper:** unsigned builds will show "cannot be opened because it is from an unidentified developer" on first launch. Right-click the app/binary → **Open**, then confirm (or run `xattr -d com.apple.quarantine <path>` in Terminal). 
+- To get the TUI/menu explicitly, run it from a terminal: `./YTMusicDownloader-linux-x64`
+  (on macOS, right-click → Open the first time, or
+  `xattr -d com.apple.quarantine <file>`).
+- To play on another device from a standalone build, run it from a
+  terminal with the LAN flag: `./YTMusicDownloader-linux-x64 serve --lan`
+  (on macOS, `./YTMusicDownloader-macos-arm64 serve --lan`). It prints a
+  `Network:` URL to open on your phone — see
+  [Play on another device](#play-on-another-device-phone-tablet-another-computer).
+
+Everything—Python, textual, FFmpeg, and Deno—is inside the one file. On first
+run it provisions the yt-dlp binary (and Deno if not bundled) into the data
+directory, so that first start needs a network connection. Subsequent starts
+are offline-ready.
+
+Your data lives in the home directory (not next to the file):
+
+| Platform | Location |
+|---|---|
+| Windows | `%APPDATA%\YTMusicDownloader\` |
+| macOS | `~/Library/Application Support/YTMusicDownloader/` |
+| Linux | `~/.local/share/yt-music-downloader/` |
+
+Set `YTM_DATA_DIR` to override the location (useful for a USB stick or to keep
+multiple profiles side by side).
+
+### From source (developers)
 
 ```bash
 git clone <repo-url>
@@ -96,7 +170,23 @@ virtualenv holds the project-local yt-dlp/Deno/FFmpeg toolchain. Use
 ```bash
 ./run.sh --version   # print version info and exit
 ./run.sh --help      # show usage
+./run.sh --tui       # start the terminal UI
+./run.sh --web       # start the web UI and open a browser
 ```
+
+### Building the standalone executable
+
+```bash
+venv/bin/pip install -r packaging/requirements-build.txt
+venv/bin/python packaging/build.py          # -> dist/YTMusicDownloader
+venv/bin/python packaging/build.py --no-deno  # smaller build
+```
+
+The `Release` GitHub Actions workflow builds all four targets automatically
+when a `v*` tag is pushed, and attaches them to the release. The
+`Build executables` workflow builds the same four targets on **every push
+to `main`/`master`** (gated on the test suite) and refreshes the rolling
+`latest-build` prerelease, so there is always a fresh downloadable binary.
 
 ### Web UI (local Spotify-style player)
 
@@ -106,23 +196,68 @@ Run the browser UI alongside or instead of the TUI:
 ./run.sh serve                 # http://127.0.0.1:8765
 ./run.sh serve --port 9000     # custom port
 ./run.sh serve --token <tok>   # require a bearer token in every API call
+./run.sh serve --open          # also open your default browser
 ```
 
 The web UI is a self-hosted local player for your downloaded music: browse
 by artist, album, year, or genre; stream any downloaded file (FLAC is
 transcoded to Opus for browsers that can't play it); search across all
-accounts; and trigger library refreshes / downloads — all without sending
-anything off-machine. When the server runs with `--token`, the UI prompts
+accounts; edit tags, build smart views of the library, queue downloads,
+export or sync the library to a folder, and read listening insights — all
+without sending anything off-machine. It works on desktop and phone
+alike. When the server runs with `--token`, the UI prompts
 for the token on first load and remembers it.
 
+#### Play on another device (phone, tablet, another computer)
+
+By default the server listens on `127.0.0.1` only, so other devices can't
+reach it. To share it on your local network:
+
+```bash
+./run.sh serve --lan           # listen on all interfaces + auto token
+```
+
+It prints a **Local** URL plus one **Network** URL per address, for example:
+
+```
+  Local:   http://127.0.0.1:8765/?token=u67hxy9URxFptdBn
+  Network: http://192.168.1.42:8765/?token=u67hxy9URxFptdBn
+```
+
+Open a **Network** URL on any device connected to the same Wi-Fi/Ethernet.
+The token is embedded in the link, so the page signs in automatically (it
+is then stored in that device's browser and stripped from the address
+bar). Nothing is exposed to the internet — only your LAN — and the token
+still gates every `/api/*` call, so keep the link to yourself.
+
+Notes:
+
+- Sharing on the network **requires a token**; `--lan` generates a random
+  one for you. Pass `--token <yours>` to pick your own, or `--host 0.0.0.0`
+  if you'd rather manage the bind yourself (a non-loopback bind without a
+  token auto-generates one too).
+- Different port: `./run.sh serve --lan --port 8766` (useful when the
+  default is already taken).
+- If a phone can't connect, check your firewall allows the port and that
+  both devices are on the same network (guest Wi-Fi and VPNs often
+  isolate clients from each other).
+- If the page keeps asking for the token even though the link contains
+  one, do a one-time hard refresh (or clear the site's cache) on that
+  device: it was holding an older copy of the player. The server now
+  version-stamps its assets and sends `no-store`, so this can't happen
+  again after a normal reload.
+- `--network` is accepted as an alias for `--lan`.
+
 API endpoints are prefixed `/api/`: `/api/health`, `/api/accounts`,
-`/api/accounts/<slug>/refresh`, `/api/accounts/<slug>/unliked`,
+`/api/browsers`, `/api/accounts/<slug>/refresh`, `/api/accounts/<slug>/unliked`,
 `/api/library`, `/api/settings`, `/api/downloads`, `/api/most-played/<slug>`,
 `/api/status/<slug>`, `/api/duplicates` (+ `within`, `export`, `remove`),
 `/api/upgrade-preview/<slug>`, `/api/yt-dlp-update`, `/api/auth-health`,
 `/api/backup` + `/api/backups` (+ `prune`), `/api/search?q=`, `/api/stats`,
 `/api/history`, `/api/lastfm` (+ `flush`), `/api/plays`, `/api/tags`,
-`/api/scheduler` (+ run-now), `/api/playlists` (+ add/remove/update/export/
+`/api/queue` (+ `start`/`remove`/`clear`/`auto`),
+`/api/export/library`, `/api/sync`, `/api/scheduler` (+ run-now),
+`/api/playlists` (+ add/remove/update/export/
 import/sync), `/api/media/<slug>/<video_id>/stream` (Range-served audio),
 `/api/art/<slug>/<video_id>.jpg`, `/api/verify`, and `/api/events`
 (Server-Sent Events for live download/refresh progress).
@@ -131,16 +266,50 @@ import/sync), `/api/media/<slug>/<video_id>/stream` (Range-served audio),
 
 ## First run: add an account
 
-1. Launch the app (`./run.sh`) and press **+ Add Account** (or `a`).
-2. Log into the YouTube Music account you want to sync in your browser.
-3. Open **Developer Tools → Network**.
-4. Find a `POST` request to `/browse` with status `200`.
-5. Right-click it → **Copy → Copy request headers**.
-6. Paste the complete request headers into the dialog and press **Test & Add**.
+**Option A — import your browser's sign-in (easiest):**
 
-The headers (including your session cookies) are stored locally in
-`accounts/<slug>/.headers_auth.json` with restrictive file permissions
-(mode 0600). They are never logged or sent anywhere except YouTube Music.
+1. Sign into YouTube Music in the browser you normally use.
+2. Launch the app (`./run.sh`) and press **+ Add Account** (or `a`).
+3. Type a display name, pick that browser in the list — and pick the
+   **profile** signed into YouTube Music, or leave the profile on
+   **Auto-detect (recommended)**: the app then checks each signed-in
+   profile against YouTube and uses the one with a live session (so an
+   untouched `Default` profile is never mistaken for your current one).
+   Then press **Import sign-in from browser** (in the web UI:
+   **Import sign-in** on the Accounts page).
+4. The app reads your youtube.com cookies from the browser's local
+   cookie store — nothing leaves your machine — and fetches your
+   liked library.
+
+   *Notes:* on Linux the cookie key lives in your login keyring
+   (GNOME Keyring/KWallet) — if the import complains it can't be read,
+   unlock the keyring, close the browser completely, and retry. On
+   Windows/macOS, close the browser completely first if the import
+   reports a locked cookie store; Chrome 127+ can encrypt cookies in a
+   way no outside app can read (app-bound/"v20") — Firefox, Edge,
+   Brave, Opera or Vivaldi are unaffected. If the app reports the
+   session is signed out, remember that **music plays while signed
+   out** — open `music.youtube.com` in that browser and check the
+   avatar at the top right before retrying, or pick a different
+   profile.
+
+**Option B — paste browser headers (fallback):**
+
+1. Log into YouTube Music in your browser.
+2. Open **Developer Tools → Network**.
+3. Find a `POST` request to `/browse` with status `200`.
+4. Right-click it → **Copy → Copy request headers**.
+5. Paste the complete request headers into the dialog and press **Test & Add**.
+
+> Why no "Sign in with Google" button? Google blocks third-party apps
+> from reading a YouTube Music library over OAuth — its internal API
+> rejects every third-party OAuth token, and the official Data API
+> can't expose liked music without a Google Cloud project of your own.
+> Browser-cookie import is the reliable, fully-local equivalent.
+
+Both auth types are stored locally under `accounts/<slug>/` with
+restrictive file permissions (mode 0600). They are never logged or sent
+anywhere except YouTube Music.
 
 ---
 
@@ -156,6 +325,9 @@ The headers (including your session cookies) are stored locally in
   accounts and remove duplicates with one click.
 - **Library Status** (`s`) — snapshot of the last refresh scan, with
   **Repair Downloads** and **Purge Unliked** actions.
+- **Play Stats** (`h`) — local listening stats: total plays, per-account
+  breakdown, top tracks/artists, and your current streak (same data as the
+  web insights view).
 - **Settings** (`p`) — change default quality / existing-file policy.
 - **Remove** — delete an account and its local data.
 
@@ -186,6 +358,18 @@ interrupted run never leaves a half-written index behind.
 ---
 
 ## Troubleshooting
+
+**Port already in use ("Address already in use" / EADDRINUSE)**
+If you try to start the web UI while another instance is already running, you'll see:
+```
+Port 8765 is already in use.
+You have another instance of the web UI already running.
+Stop the other process, or start on a different port:
+    ./run.sh serve --port 8766
+    ytm-ll-dl-modern.py serve --port 8766
+```
+
+Pick any free port and use it with `--port`.
 
 **"This application must run from inside a virtualenv."**
 Run `./install.sh` once, then `./run.sh`.

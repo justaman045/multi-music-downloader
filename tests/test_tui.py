@@ -303,3 +303,211 @@ def test_failed_titles_summary(isolated):
             await pilot.press("q")
 
     asyncio.run(scenario())
+
+
+def test_settings_save_preserves_other_keys(isolated, tmp_path):
+    """Regression: saving the TUI settings modal must merge into the
+    settings on disk, not replace them — the modal edits six keys, and a
+    bare overwrite wiped the other persisted keys (last.fm, automation,
+    rate limit, ...)."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_file = config_dir / "settings.json"
+    seeded = {
+        "default_quality": "best",
+        "lastfm_enabled": True,
+        "lastfm_api_key": "keep-me",
+        "auto_refresh_interval_hours": 6,
+        "download_rate_limit": "2M",
+        "notifications_enabled": False,
+    }
+    config_file.write_text(json.dumps(seeded), encoding="utf-8")
+
+    app = isolated.YTMusicDownloader()
+
+    async def scenario() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("p")
+            await pilot.pause()
+            app.screen_stack[-1].query_one(
+                "#save-settings",
+                Button,
+            ).press()
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            await pilot.press("q")
+
+    asyncio.run(scenario())
+
+    saved = json.loads(config_file.read_text(encoding="utf-8"))
+    # Untouched keys survive the save.
+    assert saved["lastfm_api_key"] == "keep-me"
+    assert saved["lastfm_enabled"] is True
+    assert saved["auto_refresh_interval_hours"] == 6
+    assert saved["download_rate_limit"] == "2M"
+    assert saved["notifications_enabled"] is False
+    # And the modal's own keys are present.
+    for key in (
+        "default_quality",
+        "default_existing_policy",
+        "default_session",
+        "default_limit",
+        "retry_attempts",
+        "retry_delay",
+    ):
+        assert key in saved
+
+
+# ---------------------------------------------------------------------------
+# Listening stats (Play Stats — parity with the web insights view)
+# ---------------------------------------------------------------------------
+
+def _seed_plays(app_module, slug: str, base: Path, plays: dict) -> None:
+    """Write files/<slug>/.plays.json directly (the web player's data)."""
+    out = base / "files" / slug
+    out.mkdir(parents=True, exist_ok=True)
+    (out / ".plays.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "plays": plays,
+                "recent": [],
+                "updated_at": 1700000000,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_compute_play_stats_counts(isolated):
+    """compute_play_stats() must aggregate .plays.json without any web
+    server running — same source the web insights view uses."""
+    make_account(isolated, "alpha", isolated.PROJECT_DIR)
+    _seed_plays(
+        isolated,
+        "alpha",
+        isolated.PROJECT_DIR,
+        {
+            "AbC123xyz_9": {
+                "video_id": "AbC123xyz_9",
+                "count": 3,
+                "first_played": 1700000000,
+                "last_played": 1700000100,
+            },
+            "XyZ777abc_8": {
+                "video_id": "XyZ777abc_8",
+                "count": 2,
+                "first_played": 1700000200,
+                "last_played": 1700000300,
+            },
+        },
+    )
+
+    stats, history = isolated.compute_play_stats()
+    assert stats["total_plays"] == 5
+    assert stats["unique_tracks"] == 2
+    assert stats["per_account"]["alpha"] == 5
+    assert isinstance(history["streaks"], dict)
+    assert "current" in history["streaks"]
+    assert "this" in history["week"]
+
+    # The screen must render without raising and show the totals.
+    screen = isolated.PlayStatsScreen.__new__(isolated.PlayStatsScreen)
+    screen.stats = stats
+    screen.history = history
+    assert "Total plays: 5" in screen.render_summary()
+    content = screen.render_content()
+    assert "alpha" in content
+    assert "TOP TRACKS" in content
+
+
+def test_tui_play_stats_screen_opens(isolated):
+    """The Play Stats binding (h) must open the modal, show local data,
+    and close cleanly."""
+    make_account(isolated, "alpha", isolated.PROJECT_DIR)
+    _seed_plays(
+        isolated,
+        "alpha",
+        isolated.PROJECT_DIR,
+        {
+            "AbC123xyz_9": {
+                "video_id": "AbC123xyz_9",
+                "count": 4,
+                "first_played": 1700000000,
+                "last_played": 1700000100,
+            },
+        },
+    )
+    app = isolated.YTMusicDownloader()
+
+    async def scenario() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("h")
+            await pilot.pause()
+            assert len(app.screen_stack) == 2
+            screen = app.screen_stack[-1]
+            assert "Total plays: 4" in str(screen.query_one("#summary").content)
+            screen.query_one("#close", Button).press()
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            await pilot.press("q")
+
+    asyncio.run(scenario())
+
+
+def test_tui_play_stats_binding_registered(app):
+    """Regression guard: the binding must stay in the main screen's
+    BINDINGS or the h key silently stops working."""
+    bindings = dict(
+        (key, action)
+        for key, action, _label in app.YTMusicDownloader.BINDINGS
+    )
+    assert bindings.get("h") == "play_stats"
+    assert hasattr(app.YTMusicDownloader, "action_play_stats")
+    assert hasattr(app, "PlayStatsScreen")
+    assert hasattr(app, "compute_play_stats")
+
+
+# ---------------------------------------------------------------------------
+# Add-account screen: browser import (no OAuth)
+# ---------------------------------------------------------------------------
+
+
+def test_tui_add_account_screen_offers_browser_import(isolated, monkeypatch):
+    """The add-account modal must show the browser picker + import
+    button and no Google OAuth button (OAuth library reads are blocked
+    by YouTube; browser-cookie import is the automatic path)."""
+    from textual.widgets import Select
+
+    # Pretend one browser is installed so the picker preselects it.
+    monkeypatch.setattr(
+        isolated,
+        "list_importable_browsers",
+        lambda: [
+            {"id": "chrome", "label": "Google Chrome", "available": True},
+            {"id": "firefox", "label": "Firefox", "available": False},
+        ],
+    )
+
+    app = isolated.YTMusicDownloader()
+
+    async def scenario() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("a")
+            await pilot.pause()
+            assert len(app.screen_stack) == 2
+            screen = app.screen_stack[-1]
+
+            browser_select = screen.query_one("#browser", Select)
+            assert browser_select.value == "chrome"
+
+            profile_select = screen.query_one("#profile", Select)
+            assert profile_select.value == "auto"
+
+            button_ids = {b.id for b in screen.query("Button")}
+            assert "add-browser" in button_ids
+            assert "add-oauth" not in button_ids
+
+            await pilot.press("q")
+
+    asyncio.run(scenario())

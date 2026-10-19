@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -240,6 +241,47 @@ def play_stats(app: Any, slug: str | None = None) -> dict[str, Any]:
     }
 
 
+def _listening_streaks(per_day: dict[str, int]) -> dict[str, int]:
+    """Current consecutive-day streak (today counts as unplayed-yet if
+    empty, so the streak survives until midnight) and the best streak ever
+    seen in the data."""
+    if not per_day:
+        return {"current": 0, "best": 0}
+
+    best = run = 1
+    prev: str | None = None
+    for day in sorted(per_day):
+        if prev is not None:
+            gap = (date.fromisoformat(day) - date.fromisoformat(prev)).days
+            run = run + 1 if gap == 1 else 1
+            if run > best:
+                best = run
+        prev = day
+
+    today = date.today()
+    cursor = today if today.isoformat() in per_day else today - timedelta(days=1)
+    current = 0
+    while cursor.isoformat() in per_day:
+        current += 1
+        cursor -= timedelta(days=1)
+
+    return {"current": current, "best": max(best, current)}
+
+
+def _week_compare(per_day: dict[str, int]) -> dict[str, int]:
+    """Plays in the last 7 days (incl. today) vs the 7 days before that."""
+    today = date.today()
+    this_week = sum(
+        per_day.get((today - timedelta(days=i)).isoformat(), 0)
+        for i in range(7)
+    )
+    prev_week = sum(
+        per_day.get((today - timedelta(days=7 + i)).isoformat(), 0)
+        for i in range(7)
+    )
+    return {"this": this_week, "prev": prev_week}
+
+
 def history_stats(
     app: Any,
     slug: str | None = None,
@@ -271,6 +313,8 @@ def history_stats(
         meta[(track["account"], track["id"])] = track
 
     per_day: dict[str, int] = {}
+    per_day_all: dict[str, int] = {}
+    per_hour: dict[int, int] = {}
     track_counts: dict[tuple[str, str], int] = {}
     artist_counts: dict[str, int] = {}
     album_counts: dict[str, int] = {}
@@ -280,8 +324,6 @@ def history_stats(
         data = load_plays(app, slug_now)
         for item in data.get("recent", []):
             ts = int(item.get("ts", 0))
-            if ts < cutoff:
-                continue
             progress = float(item.get("progress", 0))
             if progress < COUNTED_THRESHOLD:
                 continue
@@ -289,8 +331,19 @@ def history_stats(
             if not video_id:
                 continue
 
+            # Full-history buckets: streaks and the week comparison must
+            # not be truncated by the requested range.
+            if ts > 0:
+                day_all = time.strftime("%Y-%m-%d", time.localtime(ts))
+                per_day_all[day_all] = per_day_all.get(day_all, 0) + 1
+
+            if ts < cutoff:
+                continue
+
             day = time.strftime("%Y-%m-%d", time.localtime(ts))
             per_day[day] = per_day.get(day, 0) + 1
+            hour = time.localtime(ts).tm_hour
+            per_hour[hour] = per_hour.get(hour, 0) + 1
             track_counts[(slug_now, video_id)] = (
                 track_counts.get((slug_now, video_id), 0) + 1
             )
@@ -326,6 +379,9 @@ def history_stats(
     return {
         "days": days,
         "per_day": dict(sorted(per_day.items())),
+        "per_hour": [per_hour.get(hour, 0) for hour in range(24)],
+        "streaks": _listening_streaks(per_day_all),
+        "week": _week_compare(per_day_all),
         "total_plays": sum(per_day.values()),
         "top_tracks": top_tracks,
         "top_artists": sorted(

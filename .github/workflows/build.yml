@@ -1,0 +1,157 @@
+name: Build executables
+
+# Builds the standalone single-file executables (Windows, Linux,
+# macOS x64 + arm64) on EVERY push to main/master and publishes them
+# as a rolling "latest-build" prerelease, so users can always grab a
+# fresh binary without waiting for a version tag. The build matrix and
+# smoke test mirror .github/workflows/release.yml (which still owns
+# tagged v* releases); this workflow never matches v* tags, so the two
+# cannot trigger each other.
+
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+# Serialize builds; a newer push replaces the queued run.
+concurrency:
+  group: build-executables-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Gate (tests must pass)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install (venv + deps + Deno)
+        run: ./install.sh
+
+      - name: Install dev dependencies
+        run: venv/bin/pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Headless tests
+        run: venv/bin/python -m pytest tests/ -q
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: YTMusicDownloader-windows-x64.exe
+          - os: ubuntu-latest
+            artifact: YTMusicDownloader-linux-x64
+          - os: macos-14
+            artifact: YTMusicDownloader-macos-arm64
+          - os: macos-13
+            artifact: YTMusicDownloader-macos-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          python -m venv buildvenv
+          buildvenv/bin/pip install --disable-pip-version-check -r packaging/requirements-build.txt
+
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m venv buildvenv
+          buildvenv\Scripts\pip install --disable-pip-version-check -r packaging\requirements-build.txt
+
+      - name: Build standalone executable (Unix)
+        if: runner.os != 'Windows'
+        run: buildvenv/bin/python packaging/build.py
+
+      - name: Build standalone executable (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: buildvenv\Scripts\python packaging\build.py
+
+      - name: Smoke test (version + help + frozen paths)
+        shell: bash
+        run: |
+          if [ -f dist/YTMusicDownloader.exe ]; then
+            BIN=dist/YTMusicDownloader.exe
+          else
+            BIN=dist/YTMusicDownloader
+            chmod +x "$BIN"
+          fi
+          "$BIN" --version
+          "$BIN" --help
+          # Frozen-mode path check: run with an isolated data dir and
+          # confirm it initializes accounts/files/config there.
+          export YTM_DATA_DIR="$RUNNER_TEMP/ytm-smoke"
+          mkdir -p "$YTM_DATA_DIR"
+          "$BIN" --version
+          echo "Smoke test OK"
+
+      - name: Ad-hoc codesign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - dist/YTMusicDownloader || true
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          if [ -f dist/YTMusicDownloader.exe ]; then
+            mv dist/YTMusicDownloader.exe "dist/${{ matrix.artifact }}"
+          else
+            mv dist/YTMusicDownloader "dist/${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  publish:
+    name: Publish latest-build release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Point the rolling tag at this commit
+        run: git push --force origin "${GITHUB_SHA}:refs/tags/latest-build"
+
+      - name: Publish (or refresh) the latest-build prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view latest-build >/dev/null 2>&1; then
+            # Same-named assets are replaced (--clobber), so the
+            # download links stay stable across pushes.
+            gh release upload latest-build dist/* --clobber
+          else
+            gh release create latest-build dist/* \
+              --prerelease \
+              --title "Latest build (every push to main)" \
+              --notes "Automatically rebuilt from every push to main/master. The same four standalone binaries as tagged releases; see the README for platform-specific run notes."
+          fi
+          echo "Assets now on the release:"
+          gh release view latest-build --json assets --jq '.assets[].name'
+          echo "[Download latest-build](https://github.com/${GITHUB_REPOSITORY}/releases/tag/latest-build)" >> "$GITHUB_STEP_SUMMARY"

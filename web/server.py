@@ -18,6 +18,7 @@ import json
 import mimetypes
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -26,7 +27,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import downloads, metadata, plays, playlists, refresh, scheduler
+from . import (
+    downloads,
+    metadata,
+    plays,
+    playlists,
+    queue,
+    refresh,
+    scheduler,
+    sync,
+)
 from .bus import EventBus
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -112,6 +122,16 @@ class WebHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # silence request logging
         pass
 
+    def handle(self) -> None:
+        # Browsers close idle keep-alive sockets all the time; the reset
+        # lands mid-`readline` and would otherwise print a full
+        # traceback per closed connection. It is normal traffic, not a
+        # server fault.
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+
     def _send_json(self, data: Any, status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
         self.send_response(status)
@@ -181,10 +201,26 @@ class WebHandler(BaseHTTPRequestHandler):
             return
         if target.is_file():
             body = target.read_bytes()
+            if name == "index.html":
+                # Stamp asset URLs with the app version so a browser can
+                # never keep serving a stale SPA after an upgrade. This is
+                # the fix for "the phone keeps asking for the token": an
+                # old cached app.js has no URL-token capture.
+                version = str(getattr(self.server.web.app, "APP_VERSION", "") or "")
+                if version:
+                    text = body.decode("utf-8")
+                    text = re.sub(
+                        r"(/assets/[A-Za-z0-9_.\-]+\.(?:js|css))",
+                        lambda match: f"{match.group(1)}?v={version}",
+                        text,
+                    )
+                    body = text.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", _content_type(name))
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-cache")
+            # no-store (not no-cache): a local app re-reads these from disk
+            # every time, so caching buys nothing and risks stale JS.
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
             return
@@ -244,6 +280,12 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if head == "library":
             self._send_json(web.library())
+            return
+
+        if head == "browsers" and len(parts) == 1:
+            self._send_json(
+                web.app.list_importable_browsers()
+            )
             return
 
         if head == "accounts":
@@ -345,6 +387,10 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if head == "scheduler":
             self._send_json(web.scheduler.status())
+            return
+
+        if head == "queue" and len(parts) == 1:
+            self._send_json(queue.load_queue(web.app))
             return
 
         self._send_error(404, "Not found")
@@ -917,6 +963,34 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if head == "accounts" and len(parts) == 1:
             name = str(body.get("name", "")).strip()
+            browser = str(body.get("browser", "")).strip()
+
+            if browser:
+                # Automatic sign-in: import the browser's YouTube
+                # cookies and turn them into header-based auth.
+                if not name:
+                    self._send_error(400, "Name is required")
+                    return
+                profile = str(body.get("profile") or "").strip() or None
+                try:
+                    account = web.app.import_account_from_browser(
+                        name,
+                        browser,
+                        profile,
+                    )
+                except Exception as error:
+                    self._send_error(400, str(error))
+                    return
+                self._send_json(
+                    {
+                        "slug": account["slug"],
+                        "name": account.get("name", name),
+                        "track_count": account.get("track_count"),
+                    },
+                    status=201,
+                )
+                return
+
             headers_raw = str(body.get("headers", ""))
             if not name or not headers_raw:
                 self._send_error(400, "Name and headers are required")
@@ -1104,6 +1178,84 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if head == "scheduler" and len(parts) == 2:
             self._send_json(web.scheduler.run_now(parts[1]))
+            return
+
+        if head == "export" and len(parts) == 2 and parts[1] == "library":
+            fmt = str(body.get("format") or body.get("fmt") or "m3u").lower()
+            slug = str(body.get("slug") or "").strip() or None
+            try:
+                path = playlists.export_library(web.app, fmt, slug)
+            except ValueError as error:
+                self._send_error(400, str(error))
+                return
+            except Exception as error:
+                self._send_error(500, str(error))
+                return
+            self._send_json({"file": str(path), "format": fmt})
+            return
+
+        if head == "sync" and len(parts) == 1:
+            target = str(body.get("target") or "").strip()
+            if not target:
+                self._send_error(400, "Sync target folder is required")
+                return
+            slug = str(body.get("slug") or "").strip() or None
+            mode = str(body.get("mode") or "link").lower()
+            dry_run = bool(body.get("dry_run"))
+            try:
+                report = sync.sync_library_to_folder(
+                    web.app,
+                    target,
+                    slug=slug,
+                    mode=mode,
+                    dry_run=dry_run,
+                )
+            except ValueError as error:
+                self._send_error(400, str(error))
+                return
+            except Exception as error:
+                self._send_error(500, str(error))
+                return
+            self._send_json(report)
+            return
+
+        if head == "queue" and len(parts) == 1:
+            tracks = body.get("tracks") or []
+            if not isinstance(tracks, list) or not tracks:
+                self._send_error(400, "No tracks given")
+                return
+            self._send_json(queue.add_items(web.app, tracks))
+            return
+
+        if head == "queue" and len(parts) == 2:
+            action = parts[1]
+            if action == "start":
+                try:
+                    result = queue.start_queued_batches(
+                        web.app,
+                        web.downloads,
+                        quality=str(body.get("quality") or "") or None,
+                        policy=str(body.get("existing_policy") or "") or None,
+                        mode=str(body.get("session") or "") or None,
+                    )
+                except ValueError as error:
+                    self._send_error(400, str(error))
+                    return
+                self._send_json(result)
+                return
+            if action == "remove":
+                ids = body.get("ids") or []
+                self._send_json(queue.remove_items(web.app, ids))
+                return
+            if action == "clear":
+                self._send_json(queue.clear(web.app))
+                return
+            if action == "auto":
+                self._send_json(
+                    queue.set_auto(web.app, bool(body.get("enabled")))
+                )
+                return
+            self._send_error(404, f"Unknown queue action: {action}")
             return
 
         self._send_error(404, "Not found")
@@ -1325,6 +1477,11 @@ class WebHandler(BaseHTTPRequestHandler):
         tags = body.get("tags") or {}
         try:
             updated = self._apply_tags(account, video_id, tags)
+        except ValueError as error:
+            # Expected conditions (unknown track, nothing downloaded yet) —
+            # tell the user the actual reason, not "internal server error".
+            self._send_error(400, str(error))
+            return
         except Exception as error:
             self._send_error(500, str(error))
             return
@@ -1664,10 +1821,15 @@ class WebHandler(BaseHTTPRequestHandler):
         web = self.server.web
         if parts and parts[0] == "accounts" and len(parts) == 2:
             slug = parts[1]
-            if web.account(slug) is None:
+            account = web.account(slug)
+            if account is None:
                 self._send_error(404, "Unknown account")
                 return
-            web.app.delete_account(slug)
+            # delete_account() needs the full account record (it reads
+            # account["directory"]), not just the slug.
+            if not web.app.delete_account(account):
+                self._send_error(404, "Unknown account")
+                return
             self._send_json({"deleted": slug})
             return
         if parts and parts[0] == "playlists" and len(parts) == 2:
@@ -1764,26 +1926,110 @@ def _validate_settings(settings: dict[str, Any]) -> None:
         raise ValueError("Backup interval must be 0-336 hours")
 
 
+def lan_addresses() -> list[str]:
+    """
+    Best-effort list of this machine's non-loopback IPv4 addresses, so the
+    web UI can be reached from another device on the same network.
+
+    Uses the default-route interface (reliable even when the hostname does
+    not resolve to a LAN address, which is common on Linux) plus anything
+    the resolver reports for the hostname. Never raises.
+    """
+    addresses: list[str] = []
+
+    def _add(ip: str | None) -> None:
+        if (
+            ip
+            and not ip.startswith("127.")
+            and ip not in {"0.0.0.0", "::", ""}
+            and ip not in addresses
+        ):
+            addresses.append(ip)
+
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # No packets are sent; this only asks the OS which interface would
+        # route to the internet, i.e. the primary LAN address.
+        sock.connect(("8.8.8.8", 80))
+        _add(sock.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        if sock is not None:
+            sock.close()
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            _add(info[4][0])
+    except OSError:
+        pass
+
+    return addresses
+
+
 def run_server(
     app: Any,
     host: str = "127.0.0.1",
     port: int = 8765,
     token: str | None = None,
+    open_browser: bool = False,
 ) -> None:
     server = Server((host, port), app, token=token)
     server.web.scheduler.start()
+    wildcard = host in {"", "0.0.0.0", "::", "0:0:0:0:0:0:0:0"}
+    local_url = f"http://127.0.0.1:{port}/"
+    open_url = local_url if wildcard else f"http://{host}:{port}/"
+    suffix = f"?token={urllib.parse.quote(token)}" if token else ""
+
     print("=" * 56)
     print(" YT Music Downloader — Web UI")
     print("=" * 56)
     print()
-    print(f"  Local:   http://{host}:{port}/")
+    print(f"  Local:   {open_url}{suffix}")
+    if wildcard:
+        lan = lan_addresses()
+        for ip in lan:
+            print(f"  Network: http://{ip}:{port}/{suffix}")
+        if not lan:
+            print("  Network: (no LAN address detected — check your Wi-Fi/Ethernet)")
     if token:
         print(f"  Token:   {token}")
     print()
+    if wildcard:
+        print("  Open a Network URL above on your phone or another device")
+        print("  connected to the same Wi-Fi. The token is built into the")
+        print("  link, so it signs in automatically.")
     print("  Press Ctrl+C to stop.")
     print()
+
+    if open_browser:
+        # Open once the socket is actually accepting connections.
+        def _open() -> None:
+            try:
+                import webbrowser
+
+                webbrowser.open(f"{open_url}{suffix}")
+            except Exception:
+                pass
+
+        threading.Timer(0.8, _open).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print()
         print("Stopped.")
+    except OSError as error:
+        if error.errno in {98, 48, 10048}:  # EADDRINUSE on Unix/Windows
+            print()
+            print(f"Port {port} is already in use.")
+            print()
+            print("You have another instance of the web UI already running.")
+            print("Stop the other process, or start on a different port:")
+            print(f"    ./run.sh serve --port 8766")
+            print(f"    ytm-ll-dl-modern.py serve --port 8766")
+            return
+        print()
+        print(f"Failed to start web server: {error}")
+        raise

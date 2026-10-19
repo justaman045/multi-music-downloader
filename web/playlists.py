@@ -417,6 +417,110 @@ def export_playlist(
     return path
 
 
+def export_library(
+    app: Any,
+    fmt: str,
+    slug: str | None = None,
+) -> Path:
+    """Export the whole library (or one account) to config/exports/.
+
+    M3U only lists tracks that exist on disk (a playlist of missing files
+    is useless); CSV/JSON include everything with a `file` column that is
+    empty when nothing is downloaded.
+    """
+    if fmt not in ("m3u", "csv", "json"):
+        raise ValueError("format must be m3u, csv or json")
+
+    accounts = app.get_accounts()
+    if slug:
+        accounts = [account for account in accounts if account["slug"] == slug]
+        if not accounts:
+            raise ValueError("Unknown account")
+
+    rows: list[dict[str, Any]] = []
+    for account in accounts:
+        inventory = app.load_inventory(account)
+        for video_id, record in (inventory.get("tracks") or {}).items():
+            file_path = metadata.best_file_for(app, account, video_id)
+            rows.append(
+                {
+                    "video_id": video_id,
+                    "account": account["slug"],
+                    "account_name": account.get("name"),
+                    "title": record.get("title"),
+                    "artist": record.get("artist"),
+                    "album": record.get("album"),
+                    "file": str(file_path) if file_path else "",
+                }
+            )
+
+    rows.sort(
+        key=lambda row: (
+            (row.get("artist") or "").lower(),
+            (row.get("album") or "").lower(),
+            (row.get("title") or "").lower(),
+        )
+    )
+
+    output = app.export_directory()
+    suffix = f"-{slug}" if slug else ""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    if fmt == "json":
+        data = {
+            "version": 1,
+            "kind": "library",
+            "account": slug,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "tracks": rows,
+        }
+        path = output / f"library{suffix}-{stamp}.json"
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        temporary.replace(path)
+        return path
+
+    if fmt == "csv":
+        header = [
+            "video_id",
+            "account",
+            "title",
+            "artist",
+            "album",
+            "file",
+        ]
+        lines = [",".join(_csv_field(value) for value in header)]
+        lines.extend(
+            ",".join(
+                _csv_field(row.get(field))
+                for field in header
+            )
+            for row in rows
+        )
+        path = output / f"library{suffix}-{stamp}.csv"
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        temporary.replace(path)
+        return path
+
+    lines = ["#EXTM3U"]
+    for row in rows:
+        if not row["file"]:
+            continue
+        lines.append(
+            f"#EXTINF:0,{row.get('artist')} - {row.get('title')}"
+        )
+        lines.append(row["file"])
+    path = output / f"library{suffix}-{stamp}.m3u"
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    temporary.replace(path)
+    return path
+
+
 def _account_for(app: Any, slug: str | None) -> dict[str, Any] | None:
     if not slug:
         return None

@@ -119,7 +119,12 @@ class DownloadManager:
             snapshot["status"] = "Downloading…"
             snapshot["progress"] = 0.0
         elif event == "progress":
-            snapshot["progress"] = float(data.get("percent", 0))
+            # Worker emits "value"; accept both for compatibility
+            value = data.get("percent") if data.get("percent") is not None else data.get("value")
+            try:
+                snapshot["progress"] = float(value or 0)
+            except Exception:
+                snapshot["progress"] = 0.0
         elif event == "status":
             snapshot["status"] = data.get("text", "")
         elif event == "counts":

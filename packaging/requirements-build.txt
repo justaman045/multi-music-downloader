@@ -1,0 +1,3 @@
+# Build-time dependencies for the standalone executable.
+-r ../requirements.txt
+pyinstaller==6.22.3

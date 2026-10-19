@@ -1,6 +1,11 @@
 # Virtualenv
 venv/
 
+# Standalone build artifacts
+dist/
+build/
+packaging/.vendor/
+
 # Python
 __pycache__/
 *.py[cod]
