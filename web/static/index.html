@@ -91,12 +91,13 @@
     </main>
 
     <footer id="player">
-      <div id="player-track">
+      <div id="player-track" role="button" tabindex="0" title="Expand player">
         <div id="player-art" class="player-art"></div>
         <div class="player-meta">
           <div id="player-title" class="player-title">Nothing playing</div>
           <div id="player-artist" class="player-artist">—</div>
         </div>
+        <button id="btn-expand" class="ctl-btn" title="Expand player" aria-label="Expand player">&#8963;</button>
       </div>
       <div id="player-center">
         <div class="player-controls">
@@ -139,6 +140,48 @@
       </div>
       <div id="search-results" class="search-results"></div>
     </div>
+  </div>
+
+  <div id="player-overlay" class="player-overlay hidden" role="dialog" aria-modal="true" aria-hidden="true" aria-label="Now playing">
+    <div class="po-shell">
+      <div class="po-bar">
+        <button id="po-close" class="icon-btn" title="Collapse player" aria-label="Collapse player">&#8964;</button>
+        <div class="po-label">Now playing</div>
+        <button id="po-queue" class="icon-btn" title="Up next" aria-label="Up next">&#9776;</button>
+      </div>
+
+      <div class="po-art" id="po-art" title="Double-tap to skip 10 seconds"></div>
+
+      <div class="po-meta">
+        <div class="po-title" id="po-title">Nothing playing</div>
+        <div class="po-artist" id="po-artist">—</div>
+        <div class="po-sub" id="po-sub"></div>
+        <div class="po-chips" id="po-chips"></div>
+      </div>
+
+      <div class="po-seek">
+        <span id="po-cur">0:00</span>
+        <input id="po-seek" type="range" min="0" max="1000" value="0" aria-label="Seek" />
+        <span id="po-dur">0:00</span>
+      </div>
+
+      <div class="po-controls">
+        <button id="po-shuffle" class="ctl-btn" title="Shuffle">&#128256;</button>
+        <button id="po-prev" class="ctl-btn" title="Previous">&#9198;</button>
+        <button id="po-play" class="play-btn" title="Play/Pause (Space)">&#9654;</button>
+        <button id="po-next" class="ctl-btn" title="Next">&#9197;</button>
+        <button id="po-repeat" class="ctl-btn" title="Repeat">&#8634;</button>
+      </div>
+
+      <div class="po-utility">
+        <button id="po-sleep" class="ctl-btn" title="Sleep timer">&#9200;</button>
+        <button id="po-mute" class="ctl-btn" title="Mute (M)">&#128266;</button>
+        <input id="po-volume" type="range" min="0" max="100" value="80" aria-label="Volume" />
+      </div>
+
+      <div class="po-hint">Double-tap the artwork to skip 10 seconds</div>
+    </div>
+    <div class="po-flash" id="po-flash" aria-hidden="true"></div>
   </div>
 
   <div id="toasts"></div>

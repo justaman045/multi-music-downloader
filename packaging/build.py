@@ -51,10 +51,61 @@ def deno_asset() -> str | None:
     return None
 
 
-def vendor_deno() -> None:
-    """Download this platform's Deno binary into packaging/.vendor/."""
-    import json
+def _download(url: str, timeout: int, *, attempts: int = 4) -> bytes:
+    """Fetch a URL with retries.
+
+    GitHub's API rate-limits by source IP, and CI runs the four platform
+    builds concurrently from the same egress, so a 403 here is expected
+    rather than exceptional. Back off and retry; a 404 (asset genuinely
+    missing) is not retried.
+    """
+    import time
+    import urllib.error
     import urllib.request
+
+    delay = 3.0
+    last: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "ytm-build",
+                "Accept": "application/vnd.github+json, application/octet-stream",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise
+            last = exc
+            # 403/429 are the rate-limit shapes; 5xx is transient.
+            retryable = exc.code in {403, 429} or 500 <= exc.code < 600
+        except Exception as exc:  # timeouts, resets, DNS
+            last = exc
+            retryable = True
+
+        if not retryable or attempt == attempts:
+            break
+        print(f"  {type(last).__name__}: retrying in {delay:.0f}s "
+              f"(attempt {attempt + 1}/{attempts})")
+        time.sleep(delay)
+        delay *= 2
+
+    raise last if last else RuntimeError(f"could not fetch {url}")
+
+
+def vendor_deno() -> None:
+    """Download this platform's Deno binary into packaging/.vendor/.
+
+    Best-effort: a failure here must not fail the build. The app already
+    knows how to fetch Deno on first run, so a missing bundle only costs
+    a one-time download for the user, whereas aborting would lose the
+    whole executable.
+    """
+    import json
 
     asset = deno_asset()
 
@@ -63,48 +114,55 @@ def vendor_deno() -> None:
               "the app will download it on first run.")
         return
 
-    print(f"  Fetching {asset} ...")
-    request = urllib.request.Request(
-        "https://api.github.com/repos/denoland/deno/releases/latest",
-        headers={
-            "User-Agent": "ytm-build",
-            "Accept": "application/vnd.github+json",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        api = json.loads(response.read().decode("utf-8"))
+    try:
+        print(f"  Fetching {asset} ...")
+        api = json.loads(
+            _download(
+                "https://api.github.com/repos/denoland/deno/releases/latest",
+                timeout=60,
+            ).decode("utf-8")
+        )
 
-    url = None
-    for item in api.get("assets", []):
-        if item.get("name") == asset:
-            url = item.get("browser_download_url")
-            break
-
-    if url is None:
-        print(f"  Could not find {asset}; skipping.")
-        return
-
-    VENDOR_DIR.mkdir(parents=True, exist_ok=True)
-    archive = VENDOR_DIR / asset
-
-    with urllib.request.urlopen(url, timeout=300) as response, archive.open("wb") as out:
-        shutil.copyfileobj(response, out)
-
-    with zipfile.ZipFile(archive) as zf:
-        member = next(
-            (n for n in zf.namelist() if Path(n).name in {"deno", "deno.exe"}),
+        url = next(
+            (item.get("browser_download_url")
+             for item in api.get("assets", [])
+             if item.get("name") == asset),
             None,
         )
-        if member is None:
-            print("  Deno archive had no executable; skipping.")
+        if url is None:
+            print(f"  Could not find {asset} in the release; skipping.")
             return
-        target = VENDOR_DIR / Path(member).name
-        with zf.open(member) as src, target.open("wb") as dst:
-            shutil.copyfileobj(src, dst)
-        target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    archive.unlink(missing_ok=True)
-    print(f"  Vendored Deno into {VENDOR_DIR}")
+        blob = _download(url, timeout=300)
+
+        VENDOR_DIR.mkdir(parents=True, exist_ok=True)
+        archive = VENDOR_DIR / asset
+        archive.write_bytes(blob)
+
+        with zipfile.ZipFile(archive) as zf:
+            member = next(
+                (n for n in zf.namelist() if Path(n).name in {"deno", "deno.exe"}),
+                None,
+            )
+            if member is None:
+                print("  Deno archive had no executable; skipping.")
+                archive.unlink(missing_ok=True)
+                return
+            target = VENDOR_DIR / Path(member).name
+            with zf.open(member) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            target.chmod(
+                target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+
+        archive.unlink(missing_ok=True)
+        print(f"  Vendored Deno into {VENDOR_DIR}")
+    except Exception as exc:
+        # Degrade gracefully: build without the bundled Deno.
+        print(f"  WARNING: could not vendor Deno ({type(exc).__name__}: {exc}).")
+        print("  Continuing without it — the app downloads Deno on first run.")
+        for leftover in VENDOR_DIR.glob("deno-*.zip"):
+            leftover.unlink(missing_ok=True)
 
 
 def main() -> int:

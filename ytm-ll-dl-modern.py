@@ -63,8 +63,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "6.6.8"
-APP_BUILD = "2026-10-19-mobile-polish-now-playing"
+APP_VERSION = "6.6.9"
+APP_BUILD = "2026-10-19-expanded-player-double-tap-seek"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent

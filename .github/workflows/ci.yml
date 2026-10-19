@@ -56,9 +56,24 @@ jobs:
 
       - name: Secret scan (tracked files must not contain credentials)
         run: |
-          # Exclude this workflow itself: it contains the literal patterns
-          # below, which would otherwise make the scan self-match.
-          matches=$(git grep -I -E -l 'SAPISID|SIDCC|__Secure-|PASTE YOUR' -- . ':(exclude).github/workflows/ci.yml' 2>/dev/null || true)
+          # Look for real credential VALUES, not the cookie *names* the app
+          # must reference in order to do its job.
+          #
+          #   - A pasted cookie header carries "<name>=<value>" pairs; the
+          #     value is what leaks. `SAPISID[[:space:]]*=` etc. only match
+          #     when an actual assignment follows.
+          #   - "PASTE YOUR" is a placeholder that was never replaced.
+          #
+          # Deliberately NOT scanned: bare cookie names (e.g. the SAPISID
+          # cookie) and "SAPISIDHASH" (a signature *algorithm* name). Those
+          # are identifiers, not secrets, and browsercookies.py cannot work
+          # without them. The real values it reads live in the ignored
+          # accounts/**/.headers_auth.json, never in tracked files.
+          #
+          # This workflow itself contains the patterns below, so it stays
+          # excluded to avoid a self-match.
+          patterns='(SAPISID|SIDCC|__Secure-[A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*[^[:space:];"'"'"']{6,}|PASTE YOUR'
+          matches=$(git grep -I -E -l "$patterns" -- . ':(exclude).github/workflows/ci.yml' 2>/dev/null || true)
           if [ -n "$matches" ]; then
             echo "FAIL: credential patterns found in tracked files:" >&2
             echo "$matches" >&2

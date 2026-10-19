@@ -1,9 +1,12 @@
-# YT Music Downloader
+# YT Music Liked Player
+
+> **Download your YouTube Music liked library, then play it like Spotify — locally.**
 
 A self-contained, multi-account **YouTube Music liked-music downloader** with
 a terminal UI (TUI) and a local Spotify-style web player. Add one or more
 YouTube Music accounts, refresh your liked library, and download every liked
-track at your chosen quality — all without sending your music off-machine.
+track at your chosen quality — then browse, search and stream the whole
+collection from a player that runs on your own machine and never phones home.
 
 Everything runs inside a project-local virtualenv (`./venv`): Python
 dependencies, a `yt-dlp` binary, a Deno binary (used by yt-dlp for YouTube
@@ -71,6 +74,17 @@ challenges), and FFmpeg. No system-wide installs are required.
   with manual flush, all computed from your local play log.
 - **Works on phones** — the web UI is responsive: off-canvas navigation,
   simplified tables, and touch-friendly controls below 900px.
+- **Expandable player** — tap the now-playing bar (or its chevron) for a
+  full-screen view with large album art, album/year, library chips, a seek
+  bar, the full control set, sleep timer, mute and volume — all mirrored
+  with the compact bar.
+- **Double-tap to skip 10 seconds** — double-tap the album art: right half
+  jumps forward, left half back, clamped to the track and confirmed with an
+  on-screen flash. A single tap never seeks.
+- **OS-level now-playing** — while a track plays, the tab title becomes
+  `▶ <title> — <artist>`, the album art becomes the favicon, and the
+  lock-screen / media-key controls (play, pause, next, previous, seek)
+  drive the player.
 - **Play on another device** — `./run.sh serve --lan` shares the player on
   your local network with an auto-generated token; open the printed link on
   your phone and it signs in automatically (works on your TV, tablet, or a
@@ -207,6 +221,29 @@ export or sync the library to a folder, and read listening insights — all
 without sending anything off-machine. It works on desktop and phone
 alike. When the server runs with `--token`, the UI prompts
 for the token on first load and remembers it.
+
+#### The player
+
+The bar along the bottom is the compact player. Tap (or click) the track
+info — or the chevron on its right — to **expand it into a full-screen
+now-playing view** with the large album art, album/year, library chips
+(account, quality, genre, play count), a seek bar, the full
+shuffle/previous/play/next/repeat set, a sleep timer, mute and volume.
+
+**Double-tap the album art to skip 10 seconds**: the right half jumps
+forward, the left half jumps back (`» 10s` / `10s «` flashes on screen to
+confirm). It is clamped to the track, and a single tap never seeks. On
+phones this replaces pinch-zooming on the artwork, so it behaves like the
+streaming apps people are used to.
+
+Close the expanded view with the chevron, `Esc`, or a tap outside the
+album art. Everything you change there (shuffle, repeat, volume, seek) is
+mirrored in the compact bar, and vice versa.
+
+While a track plays, the browser tab and your OS stay in sync: the tab
+title becomes `▶ <title> — <artist>`, the album art replaces the favicon,
+and the lock-screen / media-key controls (play, pause, next, previous,
+seek) drive the player.
 
 #### Play on another device (phone, tablet, another computer)
 

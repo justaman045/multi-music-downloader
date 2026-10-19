@@ -656,6 +656,122 @@ def test_spa_view_has_content_transition():
     assert "#view > * { animation: fade-up 0.24s ease both; }" in css
 
 
+def test_spa_expanded_player_markup_and_css():
+    """The mini bar must expand into a full-screen now-playing view with the
+    large artwork, full controls, seek bar and a dismiss affordance."""
+    index = (
+        Path(__file__).resolve().parent.parent / "web" / "static" / "index.html"
+    ).read_text(encoding="utf-8")
+    css = (
+        Path(__file__).resolve().parent.parent / "web" / "static" / "styles.css"
+    ).read_text(encoding="utf-8")
+
+    assert 'id="player-overlay"' in index
+    for el in (
+        "po-art", "po-title", "po-artist", "po-sub", "po-chips",
+        "po-seek", "po-cur", "po-dur", "po-flash",
+        "po-play", "po-prev", "po-next", "po-shuffle", "po-repeat",
+        "po-mute", "po-volume", "po-sleep", "po-queue", "po-close",
+    ):
+        assert f'id="{el}"' in index, f"expanded player is missing #{el}"
+
+    # The tap-to-expand affordance on the mini bar.
+    assert 'id="btn-expand"' in index
+    assert 'id="player-track" role="button"' in index
+
+    # The overlay is a fixed, full-screen layer; its artwork is square and the
+    # tap target must not introduce a double-tap zoom delay on touch.
+    assert ".player-overlay {" in css
+    assert "position: fixed;" in css.split(".player-overlay {", 1)[1].split("}", 1)[0]
+    assert "touch-action: manipulation;" in css.split(".player-overlay {", 1)[1].split("}", 1)[0]
+    art_css = css.split(".po-art {", 1)[1].split("}", 1)[0]
+    assert "aspect-ratio: 1" in art_css
+    assert "cursor: pointer" in art_css
+    # z-index 105 keeps it above the mini bar and search, but below the queue
+    # and nav drawers so those still work on top of it.
+    assert "z-index: 105" in css
+
+
+def test_spa_expanded_player_wiring():
+    """Tapping the track info expands the view; Escape, the chevron, the queue
+    button and the scrim all collapse it. The controls must be wired to the
+    same shared handlers the mini bar uses, and both sliders must stay in sync."""
+    src = (Path(__file__).resolve().parent.parent / "web" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+
+    for fn in ("openExpanded", "closeExpanded", "expandedOpen", "wireExpandedPlayer"):
+        assert f"function {fn}(" in src, f"{fn}() is missing"
+
+    wire = extract_function_balanced(src, "wirePlayer")
+    assert "$(\"#player-track\").onclick = openExpanded" in wire, (
+        "tapping the mini bar's track info must open the expanded view"
+    )
+    assert "wireExpandedPlayer();" in wire
+
+    body = extract_function_balanced(src, "wireExpandedPlayer")
+    for ctl in ("#po-play", "#po-next", "#po-prev", "#po-shuffle", "#po-repeat",
+                "#po-mute", "#po-sleep", "#po-queue", "#po-close"):
+        assert f"{ctl}" in body, f"#{ctl} is not wired"
+    # The expanded controls must reuse the mini bar's handlers, not fork them.
+    for h in ("togglePlay", "toggleShuffle", "toggleRepeat", "toggleMute", "sleepTimerDialog"):
+        assert h in body, f"expanded controls should call {h}()"
+    assert 'e.target === overlay' in body, "the scrim must collapse the view"
+
+    # Escape must close the overlay before it reaches the queue/nav drawers.
+    esc = src[src.index('if (e.key === "Escape")'):]
+    assert "expandedOpen()" in esc[:400]
+
+    # Both seek bars / both time readouts are driven by one helper.
+    assert "function syncSeekUI(" in src
+    assert "syncSeekUI();" in src[src.index('audio.addEventListener("timeupdate"'):][:300]
+    for el in ("#seek", "#po-seek", "#cur-time", "#po-cur", "#dur-time", "#po-dur"):
+        assert f'"{el}"' in extract_function_balanced(src, "syncSeekUI")
+
+    # Dragging the volume slider must not rebuild the artwork (it would flash),
+    # so it syncs the two sliders directly instead of calling updatePlayerUI().
+    vol_body = src[src.index("function bindVolumeSlider(") :][:700]
+    # Strip JS comments first: the code carries a note explaining WHY it must
+    # not call updatePlayerUI(), and that note would trip a naive substring test.
+    vol_body = "\n".join(ln.split("//", 1)[0] for ln in vol_body.splitlines())
+    assert "syncVolumeUI();" in vol_body
+    assert "updatePlayerUI()" not in vol_body, (
+        "the volume handler must not call updatePlayerUI() — it rebuilds the "
+        "artwork <img> on every input event, which flickers mid-drag"
+    )
+
+    # updatePlayerUI() is the choke point that keeps the overlay in step.
+    update = extract_function_balanced(src, "updatePlayerUI")
+    assert "syncExpandedPlayer(" in update
+
+
+def test_spa_double_tap_skip():
+    """Double-tapping the expanded artwork skips 10s — left half back, right
+    half forward — clamped to the track bounds, with visible feedback."""
+    src = (Path(__file__).resolve().parent.parent / "web" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "function attachDoubleTapSeek(" in src
+    assert "function flashSeekFeedback(" in src
+
+    fn = src[src.index("function attachDoubleTapSeek(") :]
+    # Bounded window, so a stray second tap later doesn't skip.
+    assert "320" in fn[:900], "double-tap needs a short inter-tap window"
+    # Left half rewinds, right half forwards.
+    assert fn.count("- 10") >= 1 and fn.count("+ 10") >= 1
+    # Clamped to [0, duration] so it never seeks past the ends.
+    assert "Math.max(0, Math.min(d, target))" in fn
+    assert "flashSeekFeedback(" in fn
+
+    wire = extract_function_balanced(src, "wireExpandedPlayer")
+    assert 'attachDoubleTapSeek($("#po-art"))' in wire, (
+        "the expanded artwork is the double-tap target"
+    )
+    # It's armed from wirePlayer(), alongside the rest of the player wiring.
+    assert 'attachDoubleTapSeek($("#po-art"))' in extract_function_balanced(src, "wirePlayer") or \
+           "wireExpandedPlayer();" in extract_function_balanced(src, "wirePlayer")
+
 
 # ---------------------------------------------------------------------------
 # Account sign-in: browser-cookie import (no OAuth)

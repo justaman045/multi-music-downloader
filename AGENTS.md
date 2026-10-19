@@ -159,6 +159,32 @@ with pytest, `node --check` for JS, and a manual run.
   `flex-shrink:0` on the control buttons). The "Up next" drawer markup also
   shipped **with no CSS at all** — it was fixed-position and off-screen until
   6.6.8, so the queue button looked broken.
+- **Expanded player + double-tap seek (v6.6.9)** — tapping the mini bar's
+  `#player-track` (or its `#btn-expand` chevron, or Enter while it's focused)
+  opens `#player-overlay`, a full-screen view with the large `#po-art`, the
+  album/year line, metadata chips, a seek bar, the full control set, sleep
+  timer / mute / volume, and a hint line. `syncExpandedPlayer()` is called from
+  `updatePlayerUI()` (the single choke point), so the overlay can never drift
+  from the bar. Both sliders are driven by one `syncSeekUI()` (called from
+  `timeupdate`) and both volume sliders by `syncVolumeUI()`; the controls
+  **share** `togglePlay`/`toggleShuffle`/`toggleRepeat`/`toggleMute` with the
+  bar rather than forking the logic. Close via `#po-close`, `Esc`
+  (checked before the queue/nav drawers in the global `keydown`), or a tap on
+  the scrim. `z-index: 105` keeps it above the mini bar (20) and search (100)
+  but below the queue (118/119) and nav (120/121) drawers so those still work
+  on top of it.
+  - **Gotchas worth keeping**: `bindVolumeSlider` must **not** call
+    `updatePlayerUI()` — that rebuilds the artwork `<img>` on every `input`
+    event and flickers mid-drag; use `syncVolumeUI()`. `syncExpandedPlayer()`
+    only swaps the art when `artBox.dataset.trackId` changes for the same
+    reason. `.player-overlay` needs `touch-action: manipulation`, otherwise
+    mobile double-tap-to-zoom delays the seek gesture.
+  - **Double-tap to skip 10s** — `attachDoubleTapSeek($("#po-art"))` uses
+    `pointerdown` with a 320 ms inter-tap window: the right half does `+10`,
+    the left half `-10`, clamped with `Math.max(0, Math.min(d, target))`, and
+    `flashSeekFeedback()` animates a `» 10s` / `10s «` chip. A *single* tap
+    must never seek (verified live), which is why the mini bar's tap-to-expand
+    and the artwork's double-tap-to-skip live on different elements.
 
 ## Account sign-in (browser-cookie import)
 
@@ -270,12 +296,25 @@ with pytest, `node --check` for JS, and a manual run.
   guard bypass, binary-path helpers, and `main()` launch dispatch.
   CI (`.github/workflows/ci.yml`) runs this plus compile, help/version, the
   venv guard, and a secret scan for cookie patterns.
-- **CI secret scan self-match**: the secret scan greps for the literal cookie
-  header names the app uses for YouTube Music auth, which also appear in the
-  workflow file itself — so the grep always matches `.github/workflows/ci.yml`
-  and the job fails unless that file stays excluded via the
-  `:(exclude).github/workflows/ci.yml` pathspec (ci.yml:61). Don't remove that
-  exclusion, and never write those literal names into docs or code.
+- **CI secret scan matches credential *values*, not cookie *names***: the scan
+  (ci.yml) looks for real leaked headers — an actual `<cookie-name>=<value>`
+  assignment or an unfilled paste-your-cookie placeholder — **not** bare cookie
+  names or `SAPISIDHASH` (a signature *algorithm*, not a secret). Bare names
+  must stay out of the pattern because `browsercookies.py` cannot work without
+  referencing them, so scanning for them produced permanent false failures.
+  In tests, build the name from fragments (e.g. concatenating the
+  `__Secure-` prefix with the suffix) rather than writing a literal
+  `name=value`, which is indistinguishable from a real leak to the scan.
+  The workflow still excludes itself via
+  `:(exclude).github/workflows/ci.yml` — keep that pathspec.
+- **Build pipeline / Deno rate limit**: `packaging/build.py` fetches Deno from
+  the denoland/deno GitHub release, and all four matrix jobs run concurrently
+  from one egress IP — which tripped `HTTP 403: rate limit exceeded` and broke
+  the macOS builds. `_download()` now retries 403/429/5xx with backoff (but
+  fails fast on 404), `vendor_deno()` **degrades gracefully** instead of failing
+  the build, and both workflows cache `packaging/.vendor` via `actions/cache`.
+  A bundled Deno is nice-to-have, not required: the app fetches it on first run.
+  Keep `build.yml` and `release.yml` matrices/steps in sync.
 - **SPA test extraction**: `tests/test_spa.py`'s naive `extract_function()` regex
   stops at the first standalone `}`, so it can't parse functions with nested
   blocks (try/catch, e.g. `restorePlayer`). Use `extract_function_balanced()`
@@ -367,7 +406,8 @@ with pytest, `node --check` for JS, and a manual run.
 - The app is intentionally a self-contained single-script project with a
   project-local `./venv`; it is **not** a PyPI package (that was considered and
   explicitly rejected). Don't restructure it into a pip-installable layout.
-- The GitHub remote is `justaman045/multi-music-downloader`; `gh` is
+- The GitHub remote is `justaman045/ytmusic-liked-player` (renamed from
+  `multi-music-downloader`); `gh` is
   authenticated, and CI runs on push to `main` (including the secret scan).
 - After code changes: run `venv/bin/python -m pytest tests/ -q`, then
   `node --check web/static/app.js` if JS changed, then

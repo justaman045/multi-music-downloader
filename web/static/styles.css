@@ -986,6 +986,153 @@ table.tracks td.col-tags {
 }
 
 /* ==========================================================================
+   Expanded "now playing" overlay
+   z-index 105: above the mini bar (20) and search (100) but below the queue
+   drawer (119) and nav drawer (121), so those still work from on top.
+   ========================================================================== */
+
+#player-track { cursor: pointer; }
+
+.player-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 105;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background:
+    radial-gradient(900px 620px at 50% 0%, var(--bg-grad-a), transparent 66%),
+    linear-gradient(180deg, #0f0f18, var(--bg));
+  backdrop-filter: blur(18px);
+  /* Lets taps reach the double-tap-seek listener without a zoom delay. */
+  touch-action: manipulation;
+  animation: po-in 0.22s ease;
+}
+
+.po-shell {
+  width: 100%;
+  max-width: 520px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 18px;
+  padding: max(14px, env(safe-area-inset-top)) 22px calc(22px + env(safe-area-inset-bottom));
+}
+
+.po-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+
+.po-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.po-art {
+  width: min(72vw, 400px, 42vh);
+  aspect-ratio: 1;
+  margin: 0 auto;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel-3);
+  box-shadow: 0 26px 64px rgba(0, 0, 0, 0.62);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.po-art img { width: 100%; height: 100%; object-fit: cover; }
+.po-art .art-placeholder { font-size: 72px; }
+
+.po-meta { text-align: left; min-width: 0; }
+
+.po-title {
+  font-size: clamp(19px, 5.6vw, 25px);
+  font-weight: 800;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.po-artist {
+  margin-top: 4px;
+  font-size: 15px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.po-sub {
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.po-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+
+.po-seek {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.po-controls { display: flex; align-items: center; justify-content: center; gap: 14px; }
+.po-controls .ctl-btn { width: 46px; height: 46px; font-size: 20px; }
+.po-controls .play-btn { width: 62px; height: 62px; font-size: 26px; }
+
+.po-utility { display: flex; align-items: center; justify-content: center; gap: 12px; }
+.po-utility .ctl-btn { width: 40px; height: 40px; }
+.po-utility input[type="range"] { max-width: 190px; }
+
+.po-hint { text-align: center; font-size: 11.5px; color: var(--text-faint); }
+
+/* Double-tap feedback on the artwork. */
+.po-flash {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 20px;
+  font-weight: 800;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 106;
+}
+
+.po-flash.left { left: 7%; animation: po-flash 0.6s ease; }
+.po-flash.right { right: 7%; animation: po-flash 0.6s ease; }
+
+@keyframes po-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes po-flash {
+  0% { opacity: 0; transform: translateY(-50%) scale(0.8); }
+  22% { opacity: 1; transform: translateY(-50%) scale(1); }
+  100% { opacity: 0; transform: translateY(-50%) scale(1.12); }
+}
+
+@media (max-width: 620px) {
+  .po-shell { gap: 14px; justify-content: flex-end; padding-bottom: calc(28px + env(safe-area-inset-bottom)); }
+  .po-controls { gap: 10px; }
+  .po-controls .ctl-btn { width: 42px; height: 42px; }
+  .po-controls .play-btn { width: 56px; height: 56px; }
+}
+
+/* ==========================================================================
    Search overlay
    ========================================================================== */
 

@@ -624,12 +624,8 @@ audio.addEventListener("ended", () => {
 });
 
 audio.addEventListener("timeupdate", () => {
-  if (!audio.duration || isNaN(audio.duration)) return;
-  const frac = (audio.currentTime / audio.duration) * 1000;
-  if ($("#seek").dataset.seeking !== "1") $("#seek").value = String(Math.round(frac));
-  $("#cur-time").textContent = fmtTime(audio.currentTime);
-  $("#dur-time").textContent = fmtTime(audio.duration);
-  if (audio.currentTime / audio.duration >= 0.6) reportPlay();
+  syncSeekUI();   // keeps BOTH the mini bar and the expanded overlay in step
+  if (audio.duration && !isNaN(audio.duration) && audio.currentTime / audio.duration >= 0.6) reportPlay();
   updateMediaPositionState();
 });
 
@@ -685,6 +681,7 @@ function updatePlayerUI() {
   $("#btn-repeat").classList.toggle("active", state.player.repeat !== "off");
   $("#btn-mute").classList.toggle("active", state.player.muted);
   $("#volume").value = String(Math.round(state.player.volume * 100));
+  syncExpandedPlayer(track);
   markPlayingRows(track);
   updateNowPlayingMeta(track);
   if (!$("#queue-drawer").classList.contains("hidden")) renderQueueDrawer();
@@ -784,6 +781,217 @@ function updateMediaPositionState() {
       position: Math.min(audio.currentTime || 0, d),
     });
   } catch (e) { /* invalid state — ignore */ }
+}
+
+/* -------------------------------------------------------------------------
+ * Expanded "now playing" overlay
+ * Tapping the mini bar's track info opens a full-screen view with the large
+ * artwork and full controls. Double-tapping the artwork skips 10 seconds —
+ * left half back, right half forward (the streaming-service gesture).
+ * ---------------------------------------------------------------------- */
+
+function expandedOpen() {
+  const el = $("#player-overlay");
+  return !!el && !el.classList.contains("hidden");
+}
+
+function openExpanded() {
+  const el = $("#player-overlay");
+  if (!el) return;
+  if (!currentTrack()) {
+    toast("Nothing is playing yet", "info");
+    return;
+  }
+  el.classList.remove("hidden");
+  el.setAttribute("aria-hidden", "false");
+  syncExpandedPlayer();
+  syncSeekUI();
+}
+
+function closeExpanded() {
+  const el = $("#player-overlay");
+  if (!el) return;
+  el.classList.add("hidden");
+  el.setAttribute("aria-hidden", "true");
+}
+
+function syncExpandedPlayer(track = null) {
+  const overlay = $("#player-overlay");
+  if (!overlay) return;
+  const t = track || currentTrack();
+  const artBox = $("#po-art");
+
+  if (t) {
+    $("#po-title").textContent = t.title;
+    $("#po-artist").textContent = t.artist || "Unknown artist";
+    const bits = [t.album || "Single"];
+    if (t.year) bits.push(String(t.year));
+    $("#po-sub").textContent = bits.join(" · ");
+    // Rebuilding the <img> on every updatePlayerUI() would flash the artwork,
+    // so only swap it when the track actually changed.
+    if (artBox.dataset.trackId !== String(t.id || "")) {
+      artBox.innerHTML = t.art
+        ? `<img src="${esc(t.art)}" data-name="${esc(t.artist)}" data-big onerror="this.outerHTML=artPlaceholderFor(this)"/>`
+        : artPlaceholder(t.artist, true);
+      artBox.dataset.trackId = String(t.id || "");
+    }
+    const chip = (html) => `<span class="q-badge">${html}</span>`;
+    $("#po-chips").innerHTML = [
+      t.account_name ? chip(esc(t.account_name)) : "",
+      t.quality ? chip(`<span class="state-dot ${esc(t.status || "")}"></span>${esc(t.status === "premium" ? "Premium" : t.quality)}`) : "",
+      t.genre ? chip(esc(t.genre)) : "",
+      t.plays ? chip(`${t.plays} plays`) : "",
+    ].filter(Boolean).join("");
+  } else {
+    $("#po-title").textContent = "Nothing playing";
+    $("#po-artist").textContent = "—";
+    $("#po-sub").textContent = "";
+    $("#po-chips").innerHTML = "";
+    if (artBox.dataset.trackId) { artBox.innerHTML = artPlaceholder("?", true); artBox.dataset.trackId = ""; }
+  }
+
+  const playBtn = $("#po-play");
+  playBtn.innerHTML = state.player.playing ? "&#10074;&#10074;" : "&#9654;";
+  playBtn.title = state.player.playing ? "Pause" : "Play";
+  $("#po-shuffle").classList.toggle("active", state.player.shuffle);
+  $("#po-repeat").classList.toggle("active", state.player.repeat !== "off");
+  $("#po-mute").classList.toggle("active", state.player.muted);
+  syncVolumeUI();
+}
+
+/* -------------------------------------------------------------------------
+ * Player controls shared by the mini bar and the expanded overlay
+ * ---------------------------------------------------------------------- */
+
+function toggleShuffle() {
+  state.player.shuffle = !state.player.shuffle;
+  updatePlayerUI();
+  persistPlayer();
+}
+
+function toggleRepeat() {
+  state.player.repeat = state.player.repeat === "off" ? "all" : state.player.repeat === "all" ? "one" : "off";
+  updatePlayerUI();
+  persistPlayer();
+}
+
+function toggleMute() {
+  state.player.muted = !state.player.muted;
+  if (state.player.muted) {
+    audio.volume = 0;
+    if (state.player.volume > 0) state.player.lastVol = state.player.volume;
+  } else {
+    state.player.volume = state.player.volume > 0 ? state.player.volume : (state.player.lastVol || 0.8);
+    audio.volume = state.player.volume;
+  }
+  localStorage.setItem("ls-muted", state.player.muted ? "1" : "0");
+  updatePlayerUI();
+}
+
+/* Keeps both seek bars and both time readouts in step with the audio. */
+function syncSeekUI() {
+  const d = audio.duration;
+  const has = !!d && !isNaN(d);
+  const value = String(Math.round(has ? (audio.currentTime / d) * 1000 : 0));
+  const seek = $("#seek");
+  if (seek && seek.dataset.seeking !== "1") seek.value = value;
+  const po = $("#po-seek");
+  if (po && po.dataset.seeking !== "1") po.value = value;
+
+  const cur = fmtTime(audio.currentTime);
+  const dur = has ? fmtTime(d) : "0:00";
+  const a = $("#cur-time"); if (a) a.textContent = cur;
+  const b = $("#po-cur"); if (b) b.textContent = cur;
+  const c = $("#dur-time"); if (c) c.textContent = dur;
+  const e = $("#po-dur"); if (e) e.textContent = dur;
+}
+
+function syncVolumeUI() {
+  const v = String(Math.round(state.player.volume * 100));
+  const a = $("#volume"); if (a) a.value = v;
+  const b = $("#po-volume"); if (b) b.value = v;
+  $("#btn-mute").classList.toggle("active", state.player.muted);
+  $("#po-mute").classList.toggle("active", state.player.muted);
+}
+
+/* Shared slider bindings, so dragging either one keeps both in step. */
+function bindSeekSlider(input) {
+  if (!input) return;
+  input.addEventListener("pointerdown", () => { input.dataset.seeking = "1"; });
+  input.addEventListener("pointerup", () => { input.dataset.seeking = "0"; });
+  input.addEventListener("pointerleave", () => { input.dataset.seeking = "0"; });
+  input.addEventListener("input", () => {
+    if (!audio.duration) return;
+    audio.currentTime = (Number(input.value) / 1000) * audio.duration;
+  });
+}
+
+function bindVolumeSlider(input) {
+  if (!input) return;
+  input.addEventListener("input", () => {
+    const v = Number(input.value) / 100;
+    state.player.volume = v;
+    state.player.muted = v === 0;
+    localStorage.setItem("ls-volume", String(v));
+    localStorage.setItem("ls-muted", state.player.muted ? "1" : "0");
+    audio.volume = state.player.muted ? 0 : v;
+    syncVolumeUI();   // deliberately NOT updatePlayerUI(): it rebuilds the
+                      // artwork on every input event, which flickers while
+                      // dragging the volume slider.
+  });
+}
+
+/* Double-tap the artwork to skip ±10s: left half back, right half forward. */
+function flashSeekFeedback(delta) {
+  const el = $("#po-flash");
+  if (!el) return;
+  el.textContent = delta > 0 ? "\u00BB 10s" : "10s \u00AB";
+  el.classList.remove("left", "right");
+  void el.offsetWidth;                 // force a reflow so the animation restarts
+  el.classList.add(delta > 0 ? "right" : "left");
+}
+
+function attachDoubleTapSeek(el) {
+  if (!el) return;
+  let lastTap = 0;
+  el.addEventListener("pointerdown", (e) => {
+    const d = audio.duration;
+    if (!d || isNaN(d)) return;
+    const now = Date.now();
+    const rect = el.getBoundingClientRect();
+    const leftHalf = (e.clientX - rect.left) < rect.width / 2;
+    if (now - lastTap < 320) {
+      const target = leftHalf ? audio.currentTime - 10 : audio.currentTime + 10;
+      audio.currentTime = Math.max(0, Math.min(d, target));
+      flashSeekFeedback(leftHalf ? -10 : 10);
+      lastTap = 0;               // reset so a third tap starts a new pair
+    } else {
+      lastTap = now;
+    }
+  });
+}
+
+function wireExpandedPlayer() {
+  const overlay = $("#player-overlay");
+  if (!overlay) return;
+
+  $("#po-play").onclick = togglePlay;
+  $("#po-next").onclick = next;
+  $("#po-prev").onclick = prev;
+  $("#po-shuffle").onclick = toggleShuffle;
+  $("#po-repeat").onclick = toggleRepeat;
+  $("#po-mute").onclick = toggleMute;
+  $("#po-sleep").onclick = sleepTimerDialog;
+  $("#po-queue").onclick = toggleQueueDrawer;
+  $("#po-close").onclick = closeExpanded;
+
+  bindSeekSlider($("#po-seek"));
+  bindVolumeSlider($("#po-volume"));
+
+  // Tapping the scrim around the artwork/meta card collapses the view.
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeExpanded(); });
+
+  attachDoubleTapSeek($("#po-art"));
 }
 
 function wireMediaSession() {
@@ -3895,52 +4103,25 @@ function wirePlayer() {
   $("#btn-play").onclick = togglePlay;
   $("#btn-next").onclick = next;
   $("#btn-prev").onclick = prev;
-  $("#btn-shuffle").onclick = () => { state.player.shuffle = !state.player.shuffle; updatePlayerUI(); persistPlayer(); };
-  $("#btn-repeat").onclick = () => {
-    state.player.repeat = state.player.repeat === "off" ? "all" : state.player.repeat === "all" ? "one" : "off";
-    updatePlayerUI();
-    persistPlayer();
-  };
+  $("#btn-shuffle").onclick = toggleShuffle;
+  $("#btn-repeat").onclick = toggleRepeat;
   $("#btn-sleep").onclick = sleepTimerDialog;
   $("#btn-queue").onclick = toggleQueueDrawer;
   $("#btn-queue-close").onclick = toggleQueueDrawer;
+  $("#btn-mute").onclick = toggleMute;
 
-  const seek = $("#seek");
-  seek.addEventListener("pointerdown", () => { seek.dataset.seeking = "1"; });
-  seek.addEventListener("pointerup", () => { seek.dataset.seeking = "0"; });
-  seek.addEventListener("pointerleave", () => { seek.dataset.seeking = "0"; });
-  seek.addEventListener("input", () => {
-    if (!audio.duration) return;
-    audio.currentTime = (Number(seek.value) / 1000) * audio.duration;
-    $("#cur-time").textContent = fmtTime(audio.currentTime);
-  });
-
-  const vol = $("#volume");
-  vol.addEventListener("input", () => {
-    const v = Number(vol.value) / 100;
-    state.player.volume = v;
-    state.player.muted = v === 0;
-    localStorage.setItem("ls-volume", String(v));
-    localStorage.setItem("ls-muted", state.player.muted ? "1" : "0");
-    audio.volume = state.player.muted ? 0 : v;
-  });
-
-  $("#btn-mute").onclick = () => {
-    state.player.muted = !state.player.muted;
-    if (state.player.muted) {
-      audio.volume = 0;
-      if (state.player.volume > 0) state.player.lastVol = state.player.volume;
-    } else {
-      state.player.volume = state.player.volume > 0 ? state.player.volume : (state.player.lastVol || 0.8);
-      audio.volume = state.player.volume;
-      vol.value = String(Math.round(state.player.volume * 100));
-    }
-    localStorage.setItem("ls-muted", state.player.muted ? "1" : "0");
-    updatePlayerUI();
+  // Tapping the track info (or the chevron) opens the full now-playing view.
+  $("#player-track").onclick = openExpanded;
+  $("#player-track").onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openExpanded(); }
   };
+
+  bindSeekSlider($("#seek"));
+  bindVolumeSlider($("#volume"));
 
   const qb = $("#queue-backdrop");
   if (qb) qb.onclick = closeQueueDrawer;
+  wireExpandedPlayer();
   wireMediaSession();
 }
 
@@ -3965,6 +4146,7 @@ document.addEventListener("keydown", (e) => {
     if (searchOpen) { closeSearch(); return; }
     const root = $("#modal-root");
     if (!root.classList.contains("hidden")) { root.classList.add("hidden"); root.innerHTML = ""; return; }
+    if (expandedOpen()) { closeExpanded(); return; }
     if (!$("#queue-drawer").classList.contains("hidden")) { closeQueueDrawer(); return; }
     if (document.body.classList.contains("nav-open")) { closeNav(); return; }
   }

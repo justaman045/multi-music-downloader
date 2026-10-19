@@ -48,6 +48,16 @@ jobs:
           python -m venv buildvenv
           buildvenv\Scripts\pip install --disable-pip-version-check -r packaging\requirements-build.txt
 
+      # Deno is fetched from the denoland/deno GitHub release; four
+      # concurrent matrix jobs share one egress IP and can hit GitHub's
+      # rate limit. Cache it, and packaging/build.py retries with
+      # backoff + degrades gracefully. Keep in sync with build.yml.
+      - name: Cache Deno
+        uses: actions/cache@v4
+        with:
+          path: packaging/.vendor
+          key: deno-vendor-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packaging/build.py') }}
+
       - name: Build standalone executable (Unix)
         if: runner.os != 'Windows'
         run: buildvenv/bin/python packaging/build.py
@@ -73,6 +83,13 @@ jobs:
           export YTM_DATA_DIR="$RUNNER_TEMP/ytm-smoke"
           mkdir -p "$YTM_DATA_DIR"
           "$BIN" --version
+          # A bundled Deno is nice-to-have (it saves a first-run download),
+          # not a build requirement — report it without failing.
+          if [ -f packaging/.vendor/deno ] || [ -f packaging/.vendor/deno.exe ]; then
+            echo "Bundled Deno: yes"
+          else
+            echo "Bundled Deno: no (the app will fetch it on first run)"
+          fi
           echo "Smoke test OK"
 
       - name: Ad-hoc codesign (macOS)
