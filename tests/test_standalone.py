@@ -619,6 +619,46 @@ def test_cookieless_403_failure_detection_and_hint(isolated_app):
     assert "signed-out" in isolated_app.COOKIELESS_403_HINT
 
 
+def test_retry_backoff_delay_is_configurable(isolated_app, monkeypatch):
+    """YTM_RETRY_BACKOFF_DELAY scales the retry wait.
+
+    The CI smoke test deliberately fails a fetch and must not sit in
+    backoff for half a minute; production keeps the 3/6/12s default.
+    """
+    import urllib.error
+    import urllib.request
+
+    slept: list[float] = []
+    monkeypatch.setattr(isolated_app.time, "sleep", lambda s: slept.append(s))
+
+    def boom(_request, timeout=None):
+        raise urllib.error.HTTPError("u", 403, "rate limit", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    # Default: 3s, then doubling.
+    monkeypatch.delenv("YTM_RETRY_BACKOFF_DELAY", raising=False)
+    slept.clear()
+    with pytest.raises(urllib.error.HTTPError):
+        isolated_app.github_json("https://example.invalid")
+    assert slept == [3.0, 6.0, 12.0]
+
+    # Scaled down for tests: same attempt count, far less waiting.
+    monkeypatch.setenv("YTM_RETRY_BACKOFF_DELAY", "0.05")
+    slept.clear()
+    with pytest.raises(urllib.error.HTTPError):
+        isolated_app.github_json("https://example.invalid")
+    assert len(slept) == 3, "retry count must not change"
+    assert max(slept) < 1.0, "backoff should be scaled down"
+
+    # Garbage values must not crash startup.
+    monkeypatch.setenv("YTM_RETRY_BACKOFF_DELAY", "not-a-number")
+    slept.clear()
+    with pytest.raises(urllib.error.HTTPError):
+        isolated_app.github_json("https://example.invalid")
+    assert slept == [3.0, 6.0, 12.0], "bad input falls back to the default"
+
+
 def test_force_deno_fetch_hook_skips_existing_deno(isolated_app, tmp_path, monkeypatch):
     """YTM_FORCE_DENO_FETCH makes install_deno ignore a present binary.
 

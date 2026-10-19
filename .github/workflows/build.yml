@@ -60,9 +60,9 @@ jobs:
             artifact: YTMusicDownloader-windows-x64.exe
           - os: ubuntu-latest
             artifact: YTMusicDownloader-linux-x64
-          - os: macos-14
+          - os: macos-15
             artifact: YTMusicDownloader-macos-arm64
-          - os: macos-13
+          - os: macos-15-intel
             artifact: YTMusicDownloader-macos-x64
 
     steps:
@@ -134,16 +134,19 @@ jobs:
           # this job before. Force the app to fetch Deno into a *fresh* data
           # dir with no network at all, and require it to warn and keep
           # working instead of aborting.
+          #
+          # NOTE: no `timeout(1)` wrapper — macOS runners do not ship the GNU
+          # coreutils build, and `timeout: command not found` made this step
+          # exit 127 and fail the macOS jobs. The app has its own short
+          # urlopen timeouts and bounded retries, so it cannot hang here.
           export YTM_DATA_DIR="$RUNNER_TEMP/ytm-cold"
           rm -rf "$YTM_DATA_DIR"
           mkdir -p "$YTM_DATA_DIR"
-          # Remove any Deno the binary just unpacked, so the app really has
-          # to fetch it and really fails.
-          rm -f "$YTM_DATA_DIR"/bin/deno "$YTM_DATA_DIR"/bin/deno.exe
           set +e
           out=$(YTM_FORCE_DENO_FETCH=1 \
+                YTM_RETRY_BACKOFF_DELAY=0.1 \
                 HTTPS_PROXY="http://127.0.0.1:9" HTTP_PROXY="http://127.0.0.1:9" \
-                timeout 300 "$BIN" --version 2>&1)
+                "$BIN" --version 2>&1)
           code=$?
           set -e
           echo "$out"

@@ -64,8 +64,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "6.7.0"
-APP_BUILD = "2026-10-20-resilient-deno-setup"
+APP_VERSION = "6.7.1"
+APP_BUILD = "2026-10-20-portable-smoke-test-macos-runners"
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -415,8 +415,16 @@ def _urlopen_retrying(
     after a burst of requests or from a shared egress. Back off and retry
     instead of failing the whole startup; a 404 is a real "missing" and is
     raised immediately.
+
+    YTM_RETRY_BACKOFF_DELAY scales the wait (the CI smoke test sets it to
+    a small value so a deliberately-failing fetch does not spend half a
+    minute in backoff — the retry *count* is what matters there).
     """
-    delay = 3.0
+    try:
+        delay = float(os.environ.get("YTM_RETRY_BACKOFF_DELAY", "") or 3.0)
+    except ValueError:
+        delay = 3.0
+    delay = max(0.0, delay)
     last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
@@ -433,8 +441,9 @@ def _urlopen_retrying(
 
         if not retryable or attempt == attempts:
             break
-        time.sleep(delay)
-        delay *= 2
+        if delay:
+            time.sleep(delay)
+        delay = min(delay * 2, 60.0) if delay else 0.0
 
     raise last_error if last_error else RuntimeError(
         f"could not fetch {request.full_url}"

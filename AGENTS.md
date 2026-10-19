@@ -333,6 +333,26 @@ with pytest, `node --check` for JS, and a manual run.
   `HTTPS_PROXY` and asserts the binary **exits 0** and still prints a version —
   the exact scenario that failed the macOS job. Without the hook the smoke test
   is vacuous (a bundled Deno short-circuits the fetch).
+  `YTM_RETRY_BACKOFF_DELAY` scales the retry wait (default 3/6/12s); CI sets it
+  to `0.1` so the deliberately-failing fetch doesn't spend 40s in backoff.
+- **The smoke test must stay POSIX-portable**: macOS runners do **not** ship GNU
+  coreutils, so `timeout 300 "$BIN"` returned **exit 127 (`timeout: command not
+  found`)** and failed the macOS jobs for a reason unrelated to the app. The app
+  has bounded urlopen timeouts and retries of its own, so no wrapper is needed.
+  Don't wrap commands in GNU-only utilities in these steps.
+- **macOS runner labels are a moving target** (root cause of the ">1 hour, never
+  finishes" symptom): `macos-13` was **retired Dec 2025**, so those jobs queue
+  forever and never start — and because `build.yml` runs the matrix in one run,
+  a never-scheduled job blocked the whole pipeline. `macos-14` is deprecated
+  (retiring Nov 2 2026) and GitHub has **reduced its capacity**, plus scheduled
+  brownout windows where jobs fail outright. Current labels, per
+  `actions/runner-images`:
+  - arm64 → `macos-15` (bare label is ARM on macOS)
+  - x86_64/Intel → `macos-15-intel` (`macos-15-large` is the larger-runner
+    variant)
+  Check <https://github.com/actions/runner-images> before changing them; the
+  bare `macos-latest` tracks the newest Arm64 image (`macos-26` at time of
+  writing), so pinning `macos-15` is deliberate.
 - **SPA test extraction**: `tests/test_spa.py`'s naive `extract_function()` regex
   stops at the first standalone `}`, so it can't parse functions with nested
   blocks (try/catch, e.g. `restorePlayer`). Use `extract_function_balanced()`
